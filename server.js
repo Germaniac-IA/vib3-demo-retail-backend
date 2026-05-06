@@ -1619,6 +1619,17 @@ app.post('/api/orders', authenticate, async (req, res) => {
 
     await client.query('BEGIN');
 
+    // Normalize attribute_value_id: required if product has attributes, strip if not
+    for (const item of (items || [])) {
+      const prodInfo = await client.query('SELECT has_attributes FROM products WHERE id = $1 AND deleted_at IS NULL', [item.product_id]);
+      const hasAttrs = prodInfo.rows.length > 0 && prodInfo.rows[0].has_attributes;
+      if (hasAttrs && !item.attribute_value_id) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'El producto tiene atributos (talles/colores). Cada item debe incluir attribute_value_id. Consultá /api/products/:id para ver los atributos disponibles.' });
+      }
+      if (!hasAttrs) item.attribute_value_id = null;
+    }
+
     // Stock validation and deduction via helper (handles attributes + global)
     for (const item of (items || [])) {
       try {
@@ -1748,6 +1759,7 @@ app.post('/api/orders', authenticate, async (req, res) => {
             const crypto = require('crypto');
             const token = crypto.randomBytes(32).toString('hex');
             const expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const initialStatus = resolvedTemplateUrl ? 'template_uploaded' : 'pending_template';
             await pool.query(`
               INSERT INTO design_requests (client_id, order_id, contact_id, seña_amount, template_url, token, token_expires_at, max_render_attempts, status)
               VALUES ($1, $2, $3, $4, $5, $6, $7, 3, 'pending_template')
@@ -2642,9 +2654,14 @@ app.post('/api/orders/:id/items', authenticate, async (req, res) => {
     if (!order.rows[0]) return res.status(404).json({ error: 'Orden no encontrada' });
 
     // Get product info
-    const prod = await client.query('SELECT name, requires_stock, stock_quantity FROM products WHERE id = $1 AND deleted_at IS NULL', [product_id]);
+    const prod = await client.query('SELECT name, requires_stock, has_attributes FROM products WHERE id = $1 AND deleted_at IS NULL', [product_id]);
     if (!prod.rows[0]) return res.status(400).json({ error: 'Producto no encontrado' });
     const prodData = prod.rows[0];
+
+    // Require attribute_value_id if product has attributes
+    if (prodData.has_attributes && !req.body.attribute_value_id) {
+      return res.status(400).json({ error: 'El producto tiene atributos. Incluí attribute_value_id en el body.' });
+    }
 
     // Stock check
     if (prodData.requires_stock) {
@@ -2655,15 +2672,20 @@ app.post('/api/orders/:id/items', authenticate, async (req, res) => {
 
     await client.query('BEGIN');
 
-    // Deduct stock
+    // Deduct stock (handles attributes + global)
     if (prodData.requires_stock) {
-      await client.query('UPDATE products SET stock_quantity = stock_quantity - $1 WHERE id = $2', [quantity, product_id]);
+      if (prodData.has_attributes && req.body.attribute_value_id) {
+        await client.query('UPDATE product_attributes SET stock_quantity = stock_quantity - $1 WHERE product_id = $2 AND attribute_value_id = $3', [quantity, product_id, req.body.attribute_value_id]);
+        await client.query('UPDATE products SET stock_quantity = stock_quantity - $1 WHERE id = $2', [quantity, product_id]);
+      } else {
+        await client.query('UPDATE products SET stock_quantity = stock_quantity - $1 WHERE id = $2', [quantity, product_id]);
+      }
     }
 
     // Add item
     const itemResult = await client.query(
       'INSERT INTO order_items (order_id, product_id, product_name, quantity, unit_price, subtotal, attribute_value_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-      [orderId, product_id, prodData.name, quantity, unit_price, Number(quantity) * Number(unit_price)]
+      [orderId, product_id, prodData.name, quantity, unit_price, Number(quantity) * Number(unit_price), req.body.attribute_value_id || null]
     );
 
     // Recalculate order total
@@ -4545,6 +4567,30 @@ app.get('/api/design-requests', authenticate, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/design-requests/pending-orders — orders que cumplen para diseño pero sin DR
+app.get('/api/design-requests/pending-orders', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT DISTINCT o.id, o.order_number, o.total, o.created_at,
+             c.name as contact_name, c.phone as contact_phone,
+             c.entity_id,
+             e.name as entity_name,
+             (SELECT COALESCE(SUM(amount), 0) FROM order_payments WHERE order_id = o.id AND deleted_at IS NULL) as paid_amount
+      FROM orders o
+      JOIN order_items oi ON oi.order_id = o.id
+      JOIN products p ON p.id = oi.product_id
+      LEFT JOIN contacts c ON c.id = o.contact_id
+      LEFT JOIN entities e ON e.id = c.entity_id
+      WHERE o.payment_status_id = 3
+        AND p.genera_diseno = true
+        AND p.diseno_template_url IS NOT NULL
+        AND o.deleted_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM design_requests dr WHERE dr.order_id = o.id AND dr.deleted_at IS NULL)
+      ORDER BY o.created_at DESC`);
+    res.json(result.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/design-requests — create
 app.post('/api/design-requests', authenticate, async (req, res) => {
   try {
@@ -4556,21 +4602,57 @@ app.post('/api/design-requests', authenticate, async (req, res) => {
     }
     // Para nuevos designs: seña = SUM(order_payments.amount) (pagado)
     let señaPagada = 0;
+    let resolvedContactId = contact_id || null;
+    let resolvedEntityId = entity_id || null;
     if (order_id) {
       const paidRes = await pool.query(
         'SELECT COALESCE(SUM(amount), 0) AS seña_pagada FROM order_payments WHERE order_id = $1 AND deleted_at IS NULL',
         [order_id]
       );
       señaPagada = Number(paidRes.rows[0]?.seña_pagada || 0);
+
+      // Auto-resolve contact_id from order if not provided
+      if (!resolvedContactId) {
+        const ordRes = await pool.query('SELECT contact_id FROM orders WHERE id = $1', [order_id]);
+        if (ordRes.rows.length > 0) resolvedContactId = ordRes.rows[0].contact_id;
+      }
+    }
+
+    // Auto-resolve entity_id from contact if not provided
+    if (!resolvedEntityId && resolvedContactId) {
+      const contRes = await pool.query('SELECT entity_id FROM contacts WHERE id = $1 AND deleted_at IS NULL', [resolvedContactId]);
+      if (contRes.rows.length > 0) resolvedEntityId = contRes.rows[0].entity_id;
+    }
+
+    // Resolve template: if entity_id present, look up entity_designs
+    let resolvedTemplateUrl = template_url || null;
+    let resolvedEntityDesignId = null;
+    if (resolvedEntityId) {
+      const desRes = await pool.query(
+        'SELECT id, name, template_url FROM entity_designs WHERE entity_id = $1 AND is_active = true AND deleted_at IS NULL ORDER BY id',
+        [resolvedEntityId]
+      );
+      if (desRes.rows.length === 1) {
+        resolvedTemplateUrl = desRes.rows[0].template_url;
+        resolvedEntityDesignId = desRes.rows[0].id;
+      } else if (desRes.rows.length > 1 && !template_url) {
+        // Multiple templates — return them as options for the dashboard to pick
+        return res.status(409).json({
+          error: 'MULTIPLE_TEMPLATES',
+          message: 'La entidad tiene varios diseños. Elegí cuál corresponde.',
+          templates: desRes.rows.map(r => ({ id: r.id, name: r.name, template_url: r.template_url }))
+        });
+      }
     }
 
     const token = generateToken();
     const expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const initialStatus = resolvedTemplateUrl ? 'template_uploaded' : 'pending_template';
     const result = await pool.query(`
       INSERT INTO design_requests (client_id, order_id, contact_id, seña_amount, template_url, token, token_expires_at, max_render_attempts, status, entity_id)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending_template', $9)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $10, $9)
       RETURNING *`,
-      [req.user.client_id, order_id, contact_id, señaPagada, template_url, token, expires_at, max_attempts || 3, entity_id || null]
+      [req.user.client_id, order_id, resolvedContactId, señaPagada, resolvedTemplateUrl, token, expires_at, max_attempts || 3, resolvedEntityId || null, initialStatus]
     );
     res.status(201).json(result.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -4755,6 +4837,7 @@ app.post('/api/design-requests/:id/generate-link', authenticate, async (req, res
   try {
     const newToken = generateToken();
     const expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const initialStatus = resolvedTemplateUrl ? 'template_uploaded' : 'pending_template';
     const result = await pool.query('UPDATE design_requests SET token = $1, token_expires_at = $2, updated_at = NOW() WHERE id = $3 AND client_id = $4 AND deleted_at IS NULL RETURNING id, token, token_expires_at', [newToken, expires_at, req.params.id, req.user.client_id]);
     if (!result.rows[0]) return res.status(404).json({ error: 'No encontrado' });
     res.json(result.rows[0]);
@@ -5288,6 +5371,83 @@ app.get('/api/entities/:id/designs', authenticate, async (req, res) => {
       [req.params.id]
     );
     res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ============================================================
+// ENTITY DESIGNS (templates by entity)
+// ============================================================
+app.get('/api/entity-designs', authenticate, async (req, res) => {
+  try {
+    let sql = `SELECT ed.*, e.name AS entity_name
+       FROM entity_designs ed
+       JOIN entities e ON e.id = ed.entity_id
+       WHERE e.client_id = $1 AND ed.deleted_at IS NULL`;
+    const params = [req.user.client_id];
+    if (req.query.entity_id) {
+      sql += ` AND ed.entity_id = $2`;
+      params.push(req.query.entity_id);
+    }
+    sql += ` ORDER BY ed.created_at DESC, ed.id DESC`;
+    const { rows } = await pool.query(sql, params);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/entity-designs/upload', authenticate, async (req, res) => {
+  try {
+    const { image } = req.body || {};
+    if (!image || typeof image !== 'string') return res.status(400).json({ error: 'Imagen requerida' });
+
+    const match = image.match(/^data:(image\/(png|jpeg|jpg|webp));base64,(.+)$/i);
+    if (!match) return res.status(400).json({ error: 'Formato de imagen inválido' });
+
+    const mime = match[1].toLowerCase();
+    const ext = mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : mime.includes('webp') ? 'webp' : 'png';
+    const buffer = Buffer.from(match[3], 'base64');
+    if (!buffer.length) return res.status(400).json({ error: 'Imagen vacía' });
+    if (buffer.length > 50 * 1024 * 1024) return res.status(413).json({ error: 'Imagen demasiado pesada' });
+
+    const dir = `${templateDir}/entity-designs`;
+    fs.mkdirSync(dir, { recursive: true });
+    const filename = `${Date.now()}-${randomUUID()}.${ext}`;
+    const fullPath = `${dir}/${filename}`;
+    fs.writeFileSync(fullPath, buffer);
+
+    const url = `http://149.50.148.131:${PORT}/templates/entity-designs/${filename}`;
+    res.status(201).json({ url, path: fullPath });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/entity-designs', authenticate, async (req, res) => {
+  try {
+    const { entity_id, name, template_url, image_path, is_active } = req.body || {};
+    if (!entity_id || !name) return res.status(400).json({ error: 'entity_id y name son requeridos' });
+
+    const entity = await pool.query('SELECT id FROM entities WHERE id = $1 AND client_id = $2 AND is_active = true', [entity_id, req.user.client_id]);
+    if (!entity.rows[0]) return res.status(404).json({ error: 'Entidad no encontrada' });
+
+    const { rows } = await pool.query(
+      `INSERT INTO entity_designs (entity_id, name, template_url, image_path, is_active)
+       VALUES ($1, $2, $3, $4, COALESCE($5, true)) RETURNING *`,
+      [entity_id, name, template_url || null, image_path || null, is_active]
+    );
+    res.status(201).json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/entity-designs/:id', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE entity_designs ed
+       SET deleted_at = NOW(), updated_at = NOW()
+       FROM entities e
+       WHERE ed.entity_id = e.id AND ed.id = $1 AND e.client_id = $2 AND ed.deleted_at IS NULL
+       RETURNING ed.id`,
+      [req.params.id, req.user.client_id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Diseño no encontrado' });
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
