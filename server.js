@@ -9,7 +9,6 @@ const sharp = require('sharp');
 const { randomUUID } = require('crypto');
 const fs = require('fs');
 const { OpenAI, toFile } = require('openai');
-
 const app = express();
 const PORT = process.env.PORT || 4000;
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -906,27 +905,46 @@ app.patch('/api/input-items/:id/cost', authenticate, async (req, res) => {
     let newCost = custom_value;
 
     if (method === 'current') {
-      // No change, keep current
       const { rows } = await pool.query('SELECT default_cost FROM input_items WHERE id=$1 AND deleted_at IS NULL', [itemId]);
       newCost = rows[0]?.default_cost;
     } else if (method === 'reposition') {
-      const { rows } = await pool.query('SELECT last_cost FROM input_items WHERE id=$1 AND deleted_at IS NULL', [itemId]);
-      newCost = rows[0]?.last_cost || 0;
+      // Buscar la última compra (unit_price) del insumo en purchase_order_items
+      const { rows } = await pool.query(
+        `SELECT poi.unit_price FROM purchase_order_items poi
+         JOIN purchase_orders po ON poi.order_id = po.id
+         WHERE poi.input_item_id = $1
+           AND poi.deleted_at IS NULL
+           AND po.deleted_at IS NULL
+           AND poi.unit_price > 0
+         ORDER BY poi.created_at DESC
+         LIMIT 1`,
+        [itemId]
+      );
+      newCost = rows[0]?.unit_price || null;
+      if (newCost === null) return res.status(404).json({ error: 'No hay compras registradas para este insumo' });
     } else if (method === 'average') {
       const count = Number(avg_count) || 5;
       const { rows } = await pool.query(
-        `SELECT AVG(poi.unit_price) as avg_cost FROM purchase_order_items poi
-         JOIN purchase_orders po ON poi.order_id = po.id
-         WHERE poi.input_item_id = $1 AND poi.deleted_at IS NULL AND po.deleted_at IS NULL
-         ORDER BY poi.created_at DESC LIMIT $2`,
+        `SELECT ROUND(AVG(unit_price)::numeric, 2) as avg_cost FROM (
+           SELECT poi.unit_price FROM purchase_order_items poi
+           JOIN purchase_orders po ON poi.order_id = po.id
+           WHERE poi.input_item_id = $1
+             AND poi.deleted_at IS NULL
+             AND po.deleted_at IS NULL
+             AND poi.unit_price > 0
+           ORDER BY poi.created_at DESC
+           LIMIT $2
+         ) sub`,
         [itemId, count]
       );
-      newCost = rows[0]?.avg_cost || 0;
+      newCost = rows[0]?.avg_cost || null;
+      if (newCost === null) return res.status(404).json({ error: 'No hay compras registradas para este insumo' });
     }
 
     if (newCost === undefined || newCost === null) return res.status(400).json({ error: 'No hay datos para calcular el costo' });
+    newCost = Number(newCost);
 
-    await pool.query('UPDATE input_items SET default_cost = $1 WHERE id = $2', [newCost, itemId]);
+    await pool.query('UPDATE input_items SET default_cost = $1, last_cost = $1 WHERE id = $2', [newCost, itemId]);
     res.json({ success: true, new_cost: newCost });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -954,6 +972,98 @@ app.delete('/api/products/:productId/components/:componentId', authenticate, asy
     res.status(500).json({ error: error.message });
   }
 });
+
+// ─── UPDATE COSTS (products + input-items) ──────────────────────────
+app.post('/api/products/update-costs', authenticate, async (req, res) => {
+  try {
+    const { productIds = [], newCostPrice, increasePercent, increaseAmount } = req.body;
+    const ids = (Array.isArray(productIds) ? productIds : []).map(Number).filter(Boolean);
+    if (!ids.length) return res.status(400).json({ error: 'Sin productos seleccionados' });
+
+    let result;
+    if (newCostPrice !== undefined && newCostPrice !== null) {
+      result = await pool.query(
+        `UPDATE products SET cost_price = $1, updated_at = NOW()
+         WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[])
+         RETURNING id`,
+        [Number(newCostPrice) || 0, req.user.client_id, ids]
+      );
+    } else if (increasePercent !== undefined && increasePercent !== null) {
+      result = await pool.query(
+        `UPDATE products SET cost_price = COALESCE(cost_price, 0) * (1 + ($1::numeric / 100)), updated_at = NOW()
+         WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[])
+         RETURNING id`,
+        [Number(increasePercent) || 0, req.user.client_id, ids]
+      );
+    } else if (increaseAmount !== undefined && increaseAmount !== null) {
+      result = await pool.query(
+        `UPDATE products SET cost_price = COALESCE(cost_price, 0) + $1, updated_at = NOW()
+         WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[])
+         RETURNING id`,
+        [Number(increaseAmount) || 0, req.user.client_id, ids]
+      );
+    } else {
+      return res.status(400).json({ error: 'Falta valor de actualización' });
+    }
+
+    res.json({ success: true, updated: result.rowCount });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/input-items/update-costs', authenticate, async (req, res) => {
+  try {
+    const { inputItemIds = [], newCost } = req.body;
+    const ids = (Array.isArray(inputItemIds) ? inputItemIds : []).map(Number).filter(Boolean);
+    if (!ids.length) return res.status(400).json({ error: 'Sin insumos seleccionados' });
+    if (newCost === undefined || newCost === null) return res.status(400).json({ error: 'Falta costo' });
+
+    const result = await pool.query(
+      `UPDATE input_items SET default_cost = $1
+       WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[])
+       RETURNING id`,
+      [Number(newCost) || 0, req.user.client_id, ids]
+    );
+    res.json({ success: true, updated: result.rowCount });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+
+// ─── UPDATE PRICES ─────────────────────────────────────────────────
+app.post('/api/products/update-prices', authenticate, async (req, res) => {
+  try {
+    const { productIds = [], newPrice, increasePercent, increaseAmount } = req.body;
+    const ids = (Array.isArray(productIds) ? productIds : []).map(Number).filter(Boolean);
+    if (!ids.length) return res.status(400).json({ error: 'Sin productos seleccionados' });
+
+    if (newPrice !== undefined && newPrice !== null) {
+      const result = await pool.query(
+        `UPDATE products SET price = $1, updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id`,
+        [Number(newPrice) || 0, req.user.client_id, ids]
+      );
+      return res.json({ success: true, updated: result.rowCount });
+    }
+
+    if (increasePercent !== undefined && increasePercent !== null) {
+      const result = await pool.query(
+        `UPDATE products SET price = ROUND(price * (1 + $1::numeric / 100)), updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id`,
+        [Number(increasePercent) || 0, req.user.client_id, ids]
+      );
+      return res.json({ success: true, updated: result.rowCount });
+    }
+
+    if (increaseAmount !== undefined && increaseAmount !== null) {
+      const result = await pool.query(
+        `UPDATE products SET price = price + $1, updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id`,
+        [Number(increaseAmount) || 0, req.user.client_id, ids]
+      );
+      return res.json({ success: true, updated: result.rowCount });
+    }
+
+    return res.status(400).json({ error: 'Falta newPrice, increasePercent o increaseAmount' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 
 // ─── CONTACTS ──────────────────────────────────────────────────────
 
@@ -1202,13 +1312,13 @@ async function syncExpensePaymentStatus(expenseId, client = pool) {
 // ─── EXPENSES ─────────────────────────────────────────────────────
 app.get('/api/expenses', authenticate, async (req, res) => {
   try {
-    const { period = 'month', from, to } = req.query;
+    const { period = 'month', from, to, date_from, date_to } = req.query;
     let dateFilter = '';
     const params = [req.user.client_id];
     if (period === 'today') dateFilter = ' AND DATE(e.issue_date) = CURRENT_DATE';
-    else if (period === 'week') dateFilter = " AND DATE(e.issue_date) >= CURRENT_DATE - INTERVAL '7 days'";
-    else if (period === 'month') dateFilter = " AND DATE(e.issue_date) >= CURRENT_DATE - INTERVAL '30 days'";
-    else if (period === 'custom' && from && to) { params.push(from, to); dateFilter = ' AND DATE(e.issue_date) >= $2 AND DATE(e.issue_date) <= $3'; }
+    else if (period === 'week') dateFilter = " AND DATE(e.issue_date) >= DATE_TRUNC('week', CURRENT_DATE)";
+    else if (period === 'month') dateFilter = " AND DATE(e.issue_date) >= DATE_TRUNC('month', CURRENT_DATE)";
+    else if (period === 'custom' && (from || date_from) && (to || date_to)) { params.push(from || date_from, to || date_to); dateFilter = ' AND DATE(e.issue_date) >= $2 AND DATE(e.issue_date) <= $3'; }
     const { rows } = await pool.query(`
       SELECT e.*, ec.name as category_name, p.name as provider_name,
              pst.name as payment_status_name, pst.color as payment_status_color,
@@ -1381,9 +1491,17 @@ app.get('/api/orders/stats', authenticate, async (req, res) => {
 
 app.get('/api/orders', authenticate, async (req, res) => {
   try {
-    const { date_from, date_to } = req.query;
+    const { period, from, to, date_from, date_to } = req.query;
     let dateClause = '';
-    if (date_from && date_to) {
+    if (period === 'today') {
+      dateClause = " AND DATE(o.created_at) = CURRENT_DATE";
+    } else if (period === 'week') {
+      dateClause = " AND DATE(o.created_at) >= DATE_TRUNC('week', CURRENT_DATE)";
+    } else if (period === 'month') {
+      dateClause = " AND DATE(o.created_at) >= DATE_TRUNC('month', CURRENT_DATE)";
+    } else if (period === 'custom' && from && to) {
+      dateClause = ` AND DATE(o.created_at) >= '${from}' AND DATE(o.created_at) <= '${to}'`;
+    } else if (date_from && date_to) {
       dateClause = ` AND DATE(o.created_at) >= '${date_from}' AND DATE(o.created_at) <= '${date_to}'`;
     }
     const result = await pool.query(`
@@ -1759,7 +1877,7 @@ app.post('/api/orders', authenticate, async (req, res) => {
             const crypto = require('crypto');
             const token = crypto.randomBytes(32).toString('hex');
             const expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    const initialStatus = resolvedTemplateUrl ? 'template_uploaded' : 'pending_template';
+    // initialStatus removed - not needed here (was copy-paste bug)
             await pool.query(`
               INSERT INTO design_requests (client_id, order_id, contact_id, seña_amount, template_url, token, token_expires_at, max_render_attempts, status)
               VALUES ($1, $2, $3, $4, $5, $6, $7, 3, 'pending_template')
@@ -1877,11 +1995,41 @@ app.post('/api/orders/:id/payments', authenticate, async (req, res) => {
     if (!order.rows[0]) return res.status(404).json({ error: 'Orden no encontrada' });
 
     await client.query('BEGIN');
+
+    // Register payment
     const paymentResult = await client.query(
       'INSERT INTO order_payments (order_id, amount, payment_method_id, paid_at) VALUES ($1, $2, $3, $4) RETURNING *',
       [orderId, amount, payment_method_id, paid_at || new Date()]
     );
 
+    // Auto-create cash_movement for the payment
+    let userId = req.user.id;
+    // If is agent, use cash_user_id instead of agent id
+    if (req.user.is_agent) {
+      const agent = await client.query("SELECT cash_user_id FROM agents WHERE id = $1", [req.user.id]);
+      if (agent.rows[0]?.cash_user_id) userId = agent.rows[0].cash_user_id;
+    }
+    const { rows: userRows } = await client.query("SELECT joined_session_id FROM users WHERE id = $1", [userId]);
+    let session_id = userRows[0]?.joined_session_id || null;
+    if (!session_id) {
+      const { rows: sessRows } = await client.query(
+        "SELECT id FROM cash_sessions WHERE user_id = $1 AND status='open' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
+        [userId]
+      );
+      session_id = sessRows[0]?.id || null;
+    }
+    if (session_id) {
+      await client.query(
+        `INSERT INTO cash_movements (session_id, client_id, created_by, session_type, financial_account_id, type, reason, amount, order_id, created_at)
+         VALUES ($1, $2, $3, 'cash', $4, 'in', 'nv_payment', $5, $6, NOW())`,
+        [session_id, req.user.client_id, userId, payment_method_id || null, amount, orderId]
+      );
+    } else {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'No hay sesión de caja abierta', message: 'Necesitás abrir la caja antes de poder cobrar. Usá el comando "Abrí la caja" para empezar.' });
+    }
+
+    // Recalc payment status
     const paidSum = await client.query("SELECT COALESCE(SUM(amount), 0) as total FROM (SELECT COALESCE(SUM(amount), 0) as amount FROM order_payments WHERE order_id = $1 AND deleted_at IS NULL UNION ALL SELECT COALESCE(SUM(amount), 0) as amount FROM cash_movements WHERE order_id = $1 AND deleted_at IS NULL) as combined", [orderId]);
     const paid = Number(paidSum.rows[0].total);
     const total = Number(order.rows[0].total);
@@ -3091,7 +3239,7 @@ app.post('/api/cash-sessions/:id/kick-joined', authenticate, async (req, res) =>
 // GET /api/advances - list advances for a client or provider
 app.get('/api/advances', authenticate, async (req, res) => {
   try {
-    const { entity_type, entity_id, period, date_from, date_to } = req.query;
+    const { entity_type, entity_id, period, from, to, date_from, date_to } = req.query;
     let query = `
       SELECT a.*,
         CASE
@@ -3108,10 +3256,10 @@ app.get('/api/advances', authenticate, async (req, res) => {
     if (entity_type) { params.push(entity_type); query += ` AND a.entity_type = $${params.length}`; }
     if (entity_id) { params.push(entity_id); query += ` AND a.entity_id = $${params.length}`; }
     if (period === 'today') { query += " AND DATE(a.created_at) = CURRENT_DATE"; }
-    else if (period === 'week') { query += " AND a.created_at >= CURRENT_DATE - INTERVAL '7 days'"; }
-    else if (period === 'month') { query += " AND a.created_at >= CURRENT_DATE - INTERVAL '30 days'"; }
-    else if (period === 'custom' && date_from) { params.push(date_from); query += ` AND DATE(a.created_at) >= $${params.length}`; }
-    if (period === 'custom' && date_to) { params.push(date_to); query += ` AND DATE(a.created_at) <= $${params.length}`; }
+    else if (period === 'week') { query += " AND DATE(a.created_at) >= DATE_TRUNC('week', CURRENT_DATE)"; }
+    else if (period === 'month') { query += " AND DATE(a.created_at) >= DATE_TRUNC('month', CURRENT_DATE)"; }
+    else if (period === 'custom' && (from || date_from)) { params.push(from || date_from); query += ` AND DATE(a.created_at) >= $${params.length}`; }
+    if (period === 'custom' && (to || date_to)) { params.push(to || date_to); query += ` AND DATE(a.created_at) <= $${params.length}`; }
     query += ' ORDER BY a.created_at DESC';
     const result = await pool.query(query, params);
     res.json(result.rows);
@@ -3301,9 +3449,11 @@ app.delete('/api/client-advances/:id', authenticate, async (req, res) => {
 app.get('/api/cash-movements', async (req, res) => {
   try {
     const { type, period = 'month', from, to, date_from, date_to } = req.query;
-    let dateF = " AND DATE(cm.created_at) >= CURRENT_DATE - INTERVAL '30 days'";
+    let dateF = " AND DATE(cm.created_at) >= DATE_TRUNC('month', CURRENT_DATE)";
     if (period === 'today') dateF = " AND DATE(cm.created_at) = CURRENT_DATE";
     else if (period === 'week') dateF = " AND DATE(cm.created_at) >= CURRENT_DATE - INTERVAL '7 days'";
+    else if (period === 'month') dateF = " AND DATE(cm.created_at) >= DATE_TRUNC('month', CURRENT_DATE)";
+    else if (period === 'custom' && from && to) dateF = ` AND DATE(cm.created_at) >= '${from}' AND DATE(cm.created_at) <= '${to}'`;
     const typeF = type ? `AND cm.type = '${type}'` : '';
     const { rows } = await pool.query(
       `SELECT cm.*, fa.name as account_name, c.name as client_name,
@@ -3410,23 +3560,22 @@ app.get('/api/cash/stats', async (req, res) => {
     const { period = 'today', from, to, date_from, date_to } = req.query;
     let dateFilter = "AND DATE(cm.created_at) = CURRENT_DATE";
     const params = [];
-    if (period === 'week') dateFilter = "AND DATE(cm.created_at) >= CURRENT_DATE - INTERVAL '7 days'";
-    else if (period === 'month') dateFilter = "AND DATE(cm.created_at) >= CURRENT_DATE - INTERVAL '30 days'";
+    if (period === 'week') dateFilter = "AND DATE(cm.created_at) >= DATE_TRUNC('week', CURRENT_DATE)";
+    else if (period === 'month') dateFilter = "AND DATE(cm.created_at) >= DATE_TRUNC('month', CURRENT_DATE)";
     else if (period === 'custom' && (from || date_from) && (to || date_to)) {
       dateFilter = "AND DATE(cm.created_at) >= $1 AND DATE(cm.created_at) <= $2";
       params.push(from || date_from, to || date_to);
     }
     const { rows } = await pool.query(`
       SELECT
-        COALESCE(SUM(CASE WHEN cm.type = 'in' THEN cm.amount ELSE 0 END), 0) as total_in,
-        COALESCE(SUM(CASE WHEN cm.type = 'out' THEN cm.amount ELSE 0 END), 0) as total_out,
+        COALESCE(SUM(cm.amount), 0) as total_in,
+        0 as total_out,
         COUNT(*) as move_count,
         COUNT(DISTINCT cm.order_id) as nv_count,
-        COALESCE(SUM(CASE WHEN cm.type = 'in' THEN cm.amount ELSE 0 END), 0) - COALESCE(SUM(CASE WHEN cm.type = 'out' THEN cm.amount ELSE 0 END), 0) as net
+        COALESCE(SUM(cm.amount), 0) as net
       FROM cash_movements cm
-      JOIN cash_sessions cs ON cm.session_id = cs.id
-      WHERE cm.deleted_at IS NULL ${dateFilter}
-    `);
+      WHERE cm.type = 'in' AND cm.deleted_at IS NULL ${dateFilter}
+    `, params);
     res.json(rows[0] || { total_in: 0, total_out: 0, move_count: 0, nv_count: 0, np_count: 0, net: 0 });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -3489,7 +3638,19 @@ app.delete('/api/providers/:id', async (req, res) => {
 
 app.get('/api/purchase-orders', async (req, res) => {
   try {
-    const { status, payment_status, date_from, date_to } = req.query;
+    const { status, payment_status, period, from, to, date_from, date_to } = req.query;
+    let dateClause2 = '';
+    if (period === 'today') {
+      dateClause2 = " AND DATE(po.created_at) = CURRENT_DATE";
+    } else if (period === 'week') {
+      dateClause2 = " AND DATE(po.created_at) >= DATE_TRUNC('week', CURRENT_DATE)";
+    } else if (period === 'month') {
+      dateClause2 = " AND DATE(po.created_at) >= DATE_TRUNC('month', CURRENT_DATE)";
+    } else if (period === 'custom' && from && to) {
+      dateClause2 = ` AND DATE(po.created_at) >= '${from}' AND DATE(po.created_at) <= '${to}'`;
+    } else if (date_from && date_to) {
+      dateClause2 = ` AND DATE(po.created_at) >= '${date_from}' AND DATE(po.created_at) <= '${date_to}'`;
+    }
     let sql = `SELECT po.*, prov.name as provider_name, ps.name as status_name, ps.color as status_color,
       CASE WHEN GREATEST(COALESCE(op.paid_sum, 0), COALESCE(cm.paid_sum, 0)) >= po.total AND po.total > 0 THEN 'Pagado'
            WHEN GREATEST(COALESCE(op.paid_sum, 0), COALESCE(cm.paid_sum, 0)) > 0 THEN 'Pagado parcial'
@@ -3512,7 +3673,7 @@ app.get('/api/purchase-orders', async (req, res) => {
         SELECT purchase_order_id, COALESCE(SUM(amount), 0) AS paid_sum
         FROM cash_movements WHERE deleted_at IS NULL AND purchase_order_id IS NOT NULL AND type = 'out' GROUP BY purchase_order_id
       ) cm ON cm.purchase_order_id = po.id
-      WHERE po.deleted_at IS NULL`;
+      WHERE po.deleted_at IS NULL${dateClause2}`;
     const params = [];
     if (status) { params.push(status); sql += ` AND ps.name = $${params.length}`; }
     sql += ' ORDER BY po.created_at DESC LIMIT 100';
@@ -3624,11 +3785,11 @@ app.post('/api/purchase-orders', authenticate, async (req, res) => {
 app.get('/api/purchase-orders/stats', async (req, res) => {
   try {
     const { period = 'month', from, to } = req.query;
-    let dateFilter = "AND DATE(po.created_at) >= CURRENT_DATE - INTERVAL '30 days'";
+    let dateFilter = "AND DATE(po.created_at) >= DATE_TRUNC('month', CURRENT_DATE)";
     const params = [];
     if (period === 'today') dateFilter = "AND DATE(po.created_at) = CURRENT_DATE";
-    else if (period === 'week') dateFilter = "AND DATE(po.created_at) >= CURRENT_DATE - INTERVAL '7 days'";
-    else if (period === 'month') dateFilter = "AND DATE(po.created_at) >= CURRENT_DATE - INTERVAL '30 days'";
+    else if (period === 'week') dateFilter = "AND DATE(po.created_at) >= DATE_TRUNC('week', CURRENT_DATE)";
+    else if (period === 'month') dateFilter = "AND DATE(po.created_at) >= DATE_TRUNC('month', CURRENT_DATE)";
     else if (period === 'custom' && from && to) {
       dateFilter = "AND DATE(po.created_at) >= $1 AND DATE(po.created_at) <= $2";
       params.push(from, to);
@@ -3975,7 +4136,8 @@ app.get('/api/payment-movements', async (req, res) => {
     const { period = 'today', from, to, date_from, date_to } = req.query;
     let dateFilter = "AND DATE(cm.created_at) = CURRENT_DATE";
     if (period === 'week') dateFilter = "AND DATE(cm.created_at) >= CURRENT_DATE - INTERVAL '7 days'";
-    else if (period === 'month') dateFilter = "AND DATE(cm.created_at) >= CURRENT_DATE - INTERVAL '30 days'";
+    else if (period === 'month') dateFilter = "AND DATE(cm.created_at) >= DATE_TRUNC('month', CURRENT_DATE)";
+    else if (period === 'custom' && from && to) dateFilter = ` AND DATE(cm.created_at) >= '${from}' AND DATE(cm.created_at) <= '${to}'`;
     const { rows } = await pool.query(`SELECT cm.*, fa.name as account_name, prov.name as provider_name, prov.name as supplier_name, po.order_number, ex.expense_number, ex.description as expense_description, COALESCE(po.payment_status_id, ex.payment_status_id) as payment_status_id, pst.name as payment_status_name, pst.color as payment_status_color, u.name as created_by_name FROM cash_movements cm LEFT JOIN payment_methods fa ON cm.financial_account_id = fa.id LEFT JOIN purchase_orders po ON cm.purchase_order_id = po.id LEFT JOIN expenses ex ON cm.expense_id = ex.id LEFT JOIN providers prov ON COALESCE(cm.supplier_id, po.provider_id, ex.provider_id) = prov.id LEFT JOIN payment_statuses pst ON COALESCE(po.payment_status_id, ex.payment_status_id) = pst.id LEFT JOIN users u ON cm.created_by = u.id WHERE cm.type = 'out' AND cm.deleted_at IS NULL ${dateFilter} ORDER BY cm.created_at DESC LIMIT 200`);
     res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -4037,21 +4199,25 @@ app.delete('/api/payment-movements/:id', async (req, res) => {
 
 app.get('/api/payment/stats', async (req, res) => {
   try {
-    const { period = 'today', from, to } = req.query;
+    const { period = 'today', from, to, date_from, date_to } = req.query;
     let dateFilter = "AND DATE(cm.created_at) = CURRENT_DATE";
-    if (period === 'week') dateFilter = "AND DATE(cm.created_at) >= CURRENT_DATE - INTERVAL '7 days'";
-    else if (period === 'month') dateFilter = "AND DATE(cm.created_at) >= CURRENT_DATE - INTERVAL '30 days'";
+    const params = [];
+    if (period === 'week') dateFilter = "AND DATE(cm.created_at) >= DATE_TRUNC('week', CURRENT_DATE)";
+    else if (period === 'month') dateFilter = "AND DATE(cm.created_at) >= DATE_TRUNC('month', CURRENT_DATE)";
+    else if (period === 'custom' && (from || date_from) && (to || date_to)) {
+      dateFilter = "AND DATE(cm.created_at) >= $1 AND DATE(cm.created_at) <= $2";
+      params.push(from || date_from, to || date_to);
+    }
     const { rows } = await pool.query(`
       SELECT
-        COALESCE(SUM(CASE WHEN cm.type = 'in' THEN cm.amount ELSE 0 END), 0) as total_in,
-        COALESCE(SUM(CASE WHEN cm.type = 'out' THEN cm.amount ELSE 0 END), 0) as total_out,
+        0 as total_in,
+        COALESCE(SUM(cm.amount), 0) as total_out,
         COUNT(*) as move_count,
         COUNT(DISTINCT cm.purchase_order_id) FILTER (WHERE cm.purchase_order_id IS NOT NULL) as np_count,
-        COALESCE(SUM(CASE WHEN cm.type = 'out' THEN cm.amount ELSE 0 END), 0) - COALESCE(SUM(CASE WHEN cm.type = 'in' THEN cm.amount ELSE 0 END), 0) as net
+        COALESCE(SUM(cm.amount), 0) as net
       FROM cash_movements cm
-      JOIN cash_sessions cs ON cm.session_id = cs.id
       WHERE cm.type = 'out' AND cm.deleted_at IS NULL ${dateFilter}
-    `);
+    `, params);
     res.json(rows[0] || { total_in: 0, total_out: 0, move_count: 0, np_count: 0, net: 0 });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -4647,7 +4813,7 @@ app.post('/api/design-requests', authenticate, async (req, res) => {
 
     const token = generateToken();
     const expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    const initialStatus = resolvedTemplateUrl ? 'template_uploaded' : 'pending_template';
+    // initialStatus removed - not needed here (was copy-paste bug)
     const result = await pool.query(`
       INSERT INTO design_requests (client_id, order_id, contact_id, seña_amount, template_url, token, token_expires_at, max_render_attempts, status, entity_id)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $10, $9)
@@ -4837,7 +5003,7 @@ app.post('/api/design-requests/:id/generate-link', authenticate, async (req, res
   try {
     const newToken = generateToken();
     const expires_at = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    const initialStatus = resolvedTemplateUrl ? 'template_uploaded' : 'pending_template';
+    // initialStatus removed - not needed here (was copy-paste bug)
     const result = await pool.query('UPDATE design_requests SET token = $1, token_expires_at = $2, updated_at = NOW() WHERE id = $3 AND client_id = $4 AND deleted_at IS NULL RETURNING id, token, token_expires_at', [newToken, expires_at, req.params.id, req.user.client_id]);
     if (!result.rows[0]) return res.status(404).json({ error: 'No encontrado' });
     res.json(result.rows[0]);
@@ -4863,6 +5029,61 @@ app.post('/api/design-requests/:id/approve', authenticate, async (req, res) => {
     const { designer_prompt } = req.body;
     const result = await pool.query("UPDATE design_requests SET status = 'production_ready', designer_prompt = COALESCE($1, designer_prompt), updated_at = NOW() WHERE id = $2 AND client_id = $3 AND deleted_at IS NULL RETURNING *", [designer_prompt, req.params.id, req.user.client_id]);
     if (!result.rows[0]) return res.status(404).json({ error: 'No encontrado' });
+
+    // Si el cliente tiene plugin produccion, iniciar pipeline y avanzar a impresion
+    const cid = req.user.client_id;
+    const pluginCheck = await pool.query("SELECT plugins FROM clients WHERE id = $1 AND deleted_at IS NULL", [cid]);
+    if (pluginCheck.rows[0]?.plugins && pluginCheck.rows[0].plugins.includes('produccion')) {
+      const dr = result.rows[0];
+      if (dr.order_id) {
+        // Buscar order_items de esta orden
+        const oi = await pool.query(
+          "SELECT id FROM order_items WHERE order_id = $1 AND deleted_at IS NULL",
+          [dr.order_id]
+        );
+        if (oi.rows.length) {
+          // Ver si ya esta en produccion
+          const existing = await pool.query(
+            "SELECT id, current_stage_id FROM production_order_items WHERE order_item_id = $1 AND deleted_at IS NULL",
+            [oi.rows[0].id]
+          );
+          if (!existing.rows.length) {
+            // Obtener primer stage
+            const firstStage = await pool.query(
+              "SELECT id FROM production_stages WHERE client_id = $1 ORDER BY sort_order LIMIT 1",
+              [cid]
+            );
+            if (firstStage.rows.length) {
+              // Insertar en Diseño
+              const insert = await pool.query(
+                `INSERT INTO production_order_items (client_id, order_id, order_item_id, current_stage_id, status, started_at)
+                 VALUES ($1, $2, $3, $4, 'in_progress', NOW()) RETURNING id`,
+                [cid, dr.order_id, oi.rows[0].id, firstStage.rows[0].id]
+              );
+              const prodItemId = insert.rows[0].id;
+
+              // Avanzar a Impresión (stage sort_order 2)
+              const impresionStage = await pool.query(
+                "SELECT id FROM production_stages WHERE client_id = $1 AND sort_order = 2 AND is_active = true",
+                [cid]
+              );
+              if (impresionStage.rows.length) {
+                await pool.query(
+                  `UPDATE production_order_items SET current_stage_id = $1, updated_at = NOW() WHERE id = $2`,
+                  [impresionStage.rows[0].id, prodItemId]
+                );
+                await pool.query(
+                  `INSERT INTO production_item_log (production_item_id, from_stage_id, to_stage_id, status, notes, created_by)
+                   VALUES ($1, $2, $3, 'completed', 'Diseño aprobado, pasa a producción', $4)`,
+                  [prodItemId, firstStage.rows[0].id, impresionStage.rows[0].id, req.user.id]
+                );
+              }
+            }
+          }
+        }
+      }
+    }
+
     res.json(result.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -5468,6 +5689,7 @@ app.put('/api/products/:id/attributes/:attributeValueId/stock', authenticate, as
 });
 
 
+// Setup integraciones externas
 app.listen(PORT, () => {
   console.log(`[req.user.client_id, name, is_active !== false, sort_order || 0, has_delivery === true]🚀 VIB3.ia Backend running on http://localhost:${PORT}`);
   console.log(`   Database: ${process.env.DATABASE_URL ? 'configured' : 'NOT CONFIGURED'}`);
@@ -5630,3 +5852,24 @@ app.get("/api/products/report", authenticate, async (req, res) => {
     res.json(report);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// ── Plugins ──
+try {
+  require('./integrations')(app, pool, authenticate);
+  console.log('Modulo integraciones cargado');
+} catch (e) {
+  if (e.code !== "MODULE_NOT_FOUND") console.error('Error cargando integraciones:', e.message);
+}
+
+try {
+  require('./plugins/produccion')(app, pool, authenticate);
+  console.log('Plugin produccion cargado');
+} catch (e) {
+  if (e.code !== "MODULE_NOT_FOUND") console.error('Error cargando produccion:', e.message);
+}
+
+try {
+  require('./plugins/fabricacion')(app, pool, authenticate);
+  console.log('Plugin fabricacion cargado');
+} catch (e) {
+  if (e.code !== "MODULE_NOT_FOUND") console.error('Error cargando plugin:', e.message);
+}
