@@ -1990,6 +1990,14 @@ app.post('/api/orders/:id/payments', authenticate, async (req, res) => {
   try {
     const { amount, payment_method_id, paid_at } = req.body;
     const orderId = req.params.id;
+    const paymentAmount = Number(amount || 0);
+
+    if (!paymentAmount || paymentAmount <= 0) {
+      return res.status(400).json({ error: 'Monto inválido', message: 'Para cobrar una NV tenés que indicar un monto mayor a cero.' });
+    }
+    if (!payment_method_id) {
+      return res.status(400).json({ error: 'Medio de pago requerido', message: 'Para cobrar una NV tenés que indicar el medio/cuenta donde entra el dinero.' });
+    }
 
     const order = await client.query('SELECT * FROM orders WHERE id = $1 AND client_id = $2', [orderId, req.user.client_id]);
     if (!order.rows[0]) return res.status(404).json({ error: 'Orden no encontrada' });
@@ -1999,7 +2007,7 @@ app.post('/api/orders/:id/payments', authenticate, async (req, res) => {
     // Register payment
     const paymentResult = await client.query(
       'INSERT INTO order_payments (order_id, amount, payment_method_id, paid_at) VALUES ($1, $2, $3, $4) RETURNING *',
-      [orderId, amount, payment_method_id, paid_at || new Date()]
+      [orderId, paymentAmount, payment_method_id, paid_at || new Date()]
     );
 
     // Auto-create cash_movement for the payment
@@ -2022,7 +2030,7 @@ app.post('/api/orders/:id/payments', authenticate, async (req, res) => {
       await client.query(
         `INSERT INTO cash_movements (session_id, client_id, created_by, session_type, financial_account_id, type, reason, amount, order_id, created_at)
          VALUES ($1, $2, $3, 'cash', $4, 'in', 'nv_payment', $5, $6, NOW())`,
-        [session_id, req.user.client_id, userId, payment_method_id || null, amount, orderId]
+        [session_id, req.user.client_id, userId, payment_method_id, paymentAmount, orderId]
       );
     } else {
       await client.query('ROLLBACK');
@@ -2030,7 +2038,12 @@ app.post('/api/orders/:id/payments', authenticate, async (req, res) => {
     }
 
     // Recalc payment status
-    const paidSum = await client.query("SELECT COALESCE(SUM(amount), 0) as total FROM (SELECT COALESCE(SUM(amount), 0) as amount FROM order_payments WHERE order_id = $1 AND deleted_at IS NULL UNION ALL SELECT COALESCE(SUM(amount), 0) as amount FROM cash_movements WHERE order_id = $1 AND deleted_at IS NULL) as combined", [orderId]);
+    const paidSum = await client.query(`
+      SELECT GREATEST(
+        COALESCE((SELECT SUM(amount) FROM order_payments WHERE order_id = $1 AND deleted_at IS NULL), 0),
+        COALESCE((SELECT SUM(amount) FROM cash_movements WHERE order_id = $1 AND deleted_at IS NULL AND type = 'in'), 0)
+      ) as total
+    `, [orderId]);
     const paid = Number(paidSum.rows[0].total);
     const total = Number(order.rows[0].total);
 
