@@ -1209,6 +1209,12 @@ app.get('/api/contacts/:id/360', authenticate, async (req, res) => {
       [cid, clientId]
     )).rows;
 
+    // 7b. Suscripciones activas
+    const subscriptions = await pool.query(
+      "SELECT s.id, s.plan_id, s.start_date, s.status, s.next_billing_date, s.billing_amount, p.name AS plan_name, p.billing_cycle, p.amount AS plan_amount FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.contact_id = $1 AND s.client_id = $2 AND s.deleted_at IS NULL AND s.status != 'cancelled' ORDER BY s.created_at DESC",
+      [cid, clientId]
+    );
+
     // 8. Estadísticas expandidas
     const statsRow = (await pool.query(
       `SELECT
@@ -1244,7 +1250,8 @@ app.get('/api/contacts/:id/360', authenticate, async (req, res) => {
         avg_ticket: parseFloat(statsRow.avg_ticket) || 0,
         last_order_date: statsRow.last_order_date,
         unique_products_bought: parseInt(statsRow.unique_products_bought) || 0
-      }
+      },
+      subscriptions: subscriptions.rows
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -5886,6 +5893,382 @@ app.put('/api/products/:id/attributes/:attributeValueId/stock', authenticate, as
 
 
 // Setup integraciones externas
+
+// ═══════════════════════════════════════════════
+// SUBSCRIPTIONS / PLANS / BILLING MODULE
+// ═══════════════════════════════════════════════
+
+// ─── PLANS ───
+
+// GET /api/plans — list all active plans
+app.get('/api/plans', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, name, description, billing_cycle, amount, is_active, requires_contract, sort_order FROM plans WHERE client_id = $1 AND deleted_at IS NULL ORDER BY sort_order, id',
+      [req.user.client_id]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching plans:', err);
+    res.status(500).json({ error: 'Error al obtener planes' });
+  }
+});
+
+// POST /api/plans — create a plan
+app.post('/api/plans', authenticate, async (req, res) => {
+  const { name, description, billing_cycle, amount, requires_contract, sort_order } = req.body;
+  if (!name || !billing_cycle || !amount) {
+    return res.status(400).json({ error: 'Faltan campos requeridos: name, billing_cycle, amount' });
+  }
+  try {
+    const { rows } = await pool.query(
+      'INSERT INTO plans (client_id, name, description, billing_cycle, amount, requires_contract, sort_order) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [req.user.client_id, name, description || '', billing_cycle, amount, requires_contract || false, sort_order || 0]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error('Error creating plan:', err);
+    res.status(500).json({ error: 'Error al crear plan' });
+  }
+});
+
+// PUT /api/plans/:id — update a plan
+app.put('/api/plans/:id', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const { name, description, billing_cycle, amount, is_active, requires_contract, sort_order } = req.body;
+  try {
+    const { rows } = await pool.query(
+      'UPDATE plans SET name = COALESCE($1, name), description = COALESCE($2, description), billing_cycle = COALESCE($3, billing_cycle), amount = COALESCE($4, amount), is_active = COALESCE($5, is_active), requires_contract = COALESCE($6, requires_contract), sort_order = COALESCE($7, sort_order), updated_at = NOW() WHERE id = $8 AND client_id = $9 AND deleted_at IS NULL RETURNING *',
+      [name, description, billing_cycle, amount, is_active, requires_contract, sort_order, id, req.user.client_id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Plan no encontrado' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Error updating plan:', err);
+    res.status(500).json({ error: 'Error al actualizar plan' });
+  }
+});
+
+// DELETE /api/plans/:id — soft delete a plan
+app.delete('/api/plans/:id', authenticate, async (req, res) => {
+  try {
+    const { rowCount } = await pool.query(
+      'UPDATE plans SET deleted_at = NOW() WHERE id = $1 AND client_id = $2 AND deleted_at IS NULL',
+      [req.params.id, req.user.client_id]
+    );
+    if (rowCount === 0) return res.status(404).json({ error: 'Plan no encontrado' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error deleting plan:', err);
+    res.status(500).json({ error: 'Error al eliminar plan' });
+  }
+});
+
+// ─── SUBSCRIPTIONS ───
+
+// GET /api/subscriptions — list all active subscriptions (with contact & plan info)
+app.get('/api/subscriptions', authenticate, async (req, res) => {
+  const { status, contact_id } = req.query;
+  let conditions = 's.client_id = $1 AND s.deleted_at IS NULL';
+  const params = [req.user.client_id];
+  if (status) {
+    params.push(status);
+    conditions += ' AND s.status = $' + params.length;
+  }
+  if (contact_id) {
+    params.push(contact_id);
+    conditions += ' AND s.contact_id = $' + params.length;
+  }
+  try {
+    const query = 'SELECT s.*, c.name AS contact_name, c.phone AS contact_phone, p.name AS plan_name, p.billing_cycle, p.amount AS plan_amount FROM subscriptions s JOIN contacts c ON c.id = s.contact_id JOIN plans p ON p.id = s.plan_id WHERE ' + conditions + ' ORDER BY s.next_billing_date ASC';
+    const { rows } = await pool.query(query, params);
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching subscriptions:', err);
+    res.status(500).json({ error: 'Error al obtener suscripciones' });
+  }
+});
+
+// GET /api/subscriptions/:id — single subscription detail
+app.get('/api/subscriptions/:id', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT s.*, c.name AS contact_name, c.phone AS contact_phone, p.name AS plan_name, p.billing_cycle, p.amount AS plan_amount FROM subscriptions s JOIN contacts c ON c.id = s.contact_id JOIN plans p ON p.id = s.plan_id WHERE s.id = $1 AND s.client_id = $2 AND s.deleted_at IS NULL',
+      [req.params.id, req.user.client_id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Suscripción no encontrada' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Error fetching subscription:', err);
+    res.status(500).json({ error: 'Error al obtener suscripción' });
+  }
+});
+
+// POST /api/subscriptions — create a subscription (also generates first billing cycle)
+app.post('/api/subscriptions', authenticate, async (req, res) => {
+  const { contact_id, plan_id, start_date, billing_amount, default_payment_method_id, notes } = req.body;
+  if (!contact_id || !plan_id) {
+    return res.status(400).json({ error: 'Faltan campos: contact_id, plan_id' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Verify plan exists
+    const { rows: planRows } = await client.query(
+      'SELECT id, name, billing_cycle, amount FROM plans WHERE id = $1 AND client_id = $2 AND deleted_at IS NULL AND is_active = true',
+      [plan_id, req.user.client_id]
+    );
+    if (planRows.length === 0) throw { status: 404, message: 'Plan no encontrado' };
+
+    const plan = planRows[0];
+    const start = start_date ? new Date(start_date) : new Date();
+    const amount = billing_amount || plan.amount;
+
+    // Calculate next billing date based on cycle
+    const nextBilling = new Date(start);
+    const cycleMap = { weekly: 7, biweekly: 14, monthly: 30, quarterly: 90, semiannual: 180, annual: 365 };
+    const daysToAdd = cycleMap[plan.billing_cycle] || 30;
+    nextBilling.setDate(nextBilling.getDate() + daysToAdd);
+    const nextBillingStr = nextBilling.toISOString().split('T')[0];
+
+    // Create subscription
+    const { rows: subRows } = await client.query(
+      'INSERT INTO subscriptions (client_id, contact_id, plan_id, start_date, next_billing_date, billing_amount, default_payment_method_id, notes, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *',
+      [req.user.client_id, contact_id, plan_id, start.toISOString().split('T')[0], nextBillingStr, amount, default_payment_method_id || null, notes || null, req.user.id]
+    );
+
+    // Generate first billing cycle
+    const periodEnd = new Date(start);
+    periodEnd.setDate(periodEnd.getDate() + daysToAdd);
+    const { rows: bcRows } = await client.query(
+      'INSERT INTO billing_cycles (client_id, subscription_id, period_start, period_end, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [req.user.client_id, subRows[0].id, start.toISOString().split('T')[0], periodEnd.toISOString().split('T')[0], amount, nextBillingStr]
+    );
+
+    // Create invoice item for this cycle
+    await client.query(
+      'INSERT INTO invoice_items (client_id, billing_cycle_id, description, amount, type, quantity, unit_price) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [req.user.client_id, bcRows[0].id, 'Cuota ' + plan.name, amount, 'subscription', 1, amount]
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json({
+      subscription: subRows[0],
+      billing_cycle: bcRows[0]
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error creating subscription:', err);
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    res.status(500).json({ error: 'Error al crear suscripción' });
+  } finally {
+    client.release();
+  }
+});
+
+// PUT /api/subscriptions/:id — update subscription
+app.put('/api/subscriptions/:id', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const { plan_id, status, billing_amount, default_payment_method_id, notes } = req.body;
+  try {
+    const { rows } = await pool.query(
+      'UPDATE subscriptions SET plan_id = COALESCE($1, plan_id), status = COALESCE($2, status), billing_amount = COALESCE($3, billing_amount), default_payment_method_id = COALESCE($4, default_payment_method_id), notes = COALESCE($5, notes), updated_at = NOW() WHERE id = $6 AND client_id = $7 AND deleted_at IS NULL RETURNING *',
+      [plan_id, status, billing_amount, default_payment_method_id, notes, id, req.user.client_id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Suscripción no encontrada' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Error updating subscription:', err);
+    res.status(500).json({ error: 'Error al actualizar suscripción' });
+  }
+});
+
+// DELETE /api/subscriptions/:id — soft delete / cancel
+app.delete('/api/subscriptions/:id', authenticate, async (req, res) => {
+  try {
+    const { rowCount } = await pool.query(
+      'UPDATE subscriptions SET deleted_at = NOW(), status = $1 WHERE id = $2 AND client_id = $3 AND deleted_at IS NULL',
+      ['cancelled', req.params.id, req.user.client_id]
+    );
+    if (rowCount === 0) return res.status(404).json({ error: 'Suscripción no encontrada' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error deleting subscription:', err);
+    res.status(500).json({ error: 'Error al cancelar suscripción' });
+  }
+});
+
+// ─── BILLING CYCLES ───
+
+// GET /api/subscriptions/:id/billing-cycles — billing cycles for a subscription
+app.get('/api/subscriptions/:id/billing-cycles', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT bc.*, (SELECT COALESCE(JSON_AGG(json_build_object(\'id\', ii.id, \'description\', ii.description, \'amount\', ii.amount, \'type\', ii.type, \'quantity\', ii.quantity, \'unit_price\', ii.unit_price) ORDER BY ii.id), \'[]\'::json) FROM invoice_items ii WHERE ii.billing_cycle_id = bc.id AND ii.deleted_at IS NULL) AS items FROM billing_cycles bc WHERE bc.subscription_id = $1 AND bc.client_id = $2 AND bc.deleted_at IS NULL ORDER BY bc.period_start DESC',
+      [req.params.id, req.user.client_id]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching billing cycles:', err);
+    res.status(500).json({ error: 'Error al obtener ciclos de facturación' });
+  }
+});
+
+// POST /api/subscriptions/:id/generate-cycle — manually generate next billing cycle
+app.post('/api/subscriptions/:id/generate-cycle', authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: subRows } = await client.query(
+      'SELECT * FROM subscriptions WHERE id = $1 AND client_id = $2 AND deleted_at IS NULL',
+      [req.params.id, req.user.client_id]
+    );
+    if (subRows.length === 0) throw { status: 404, message: 'Suscripción no encontrada' };
+    const sub = subRows[0];
+
+    // Get last billing cycle to calculate next period
+    const { rows: bcRows } = await client.query(
+      'SELECT * FROM billing_cycles WHERE subscription_id = $1 AND deleted_at IS NULL ORDER BY period_end DESC LIMIT 1',
+      [sub.id]
+    );
+    const lastEnd = bcRows.length > 0 ? new Date(bcRows[0].period_end) : new Date(sub.start_date);
+
+    const periodStart = new Date(lastEnd);
+    periodStart.setDate(periodStart.getDate() + 1);
+
+    // Get plan info for cycle calculation
+    const { rows: planRows } = await client.query(
+      'SELECT billing_cycle FROM plans WHERE id = $1',
+      [sub.plan_id]
+    );
+    const cycleMap = { weekly: 7, biweekly: 14, monthly: 30, quarterly: 90, semiannual: 180, annual: 365 };
+    const days = cycleMap[planRows[0]?.billing_cycle] || 30;
+
+    const periodEnd = new Date(periodStart);
+    periodEnd.setDate(periodEnd.getDate() + days);
+
+    // Update subscription next_billing_date
+    const nextBilling = new Date(periodEnd);
+    nextBilling.setDate(nextBilling.getDate() + 1);
+
+    const { rows: newBC } = await client.query(
+      'INSERT INTO billing_cycles (client_id, subscription_id, period_start, period_end, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [req.user.client_id, sub.id, periodStart.toISOString().split('T')[0], periodEnd.toISOString().split('T')[0], sub.billing_amount, nextBilling.toISOString().split('T')[0]]
+    );
+
+    // Create invoice item
+    const { rows: planName } = await client.query('SELECT name FROM plans WHERE id = $1', [sub.plan_id]);
+    await client.query(
+      'INSERT INTO invoice_items (client_id, billing_cycle_id, description, amount, type, quantity, unit_price) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [req.user.client_id, newBC[0].id, 'Cuota ' + (planName[0]?.name || ''), sub.billing_amount, 'subscription', 1, sub.billing_amount]
+    );
+
+    await client.query(
+      'UPDATE subscriptions SET next_billing_date = $1, updated_at = NOW() WHERE id = $2',
+      [nextBilling.toISOString().split('T')[0], sub.id]
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json(newBC[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error generating cycle:', err);
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    res.status(500).json({ error: 'Error al generar ciclo' });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/billing-cycles/:id/pay — mark a billing cycle as paid (with payment registration)
+app.post('/api/billing-cycles/:id/pay', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const { payment_method_id, amount, paid_at } = req.body;
+  if (!payment_method_id || !amount) {
+    return res.status(400).json({ error: 'Faltan campos: payment_method_id, amount' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: bcRows } = await client.query(
+      'SELECT bc.*, s.contact_id, s.client_id FROM billing_cycles bc JOIN subscriptions s ON s.id = bc.subscription_id WHERE bc.id = $1 AND bc.client_id = $2 AND bc.deleted_at IS NULL',
+      [id, req.user.client_id]
+    );
+    if (bcRows.length === 0) throw { status: 404, message: 'Ciclo no encontrado' };
+
+    const bc = bcRows[0];
+    const paymentDate = paid_at ? new Date(paid_at) : new Date();
+
+    // Mark billing cycle as paid
+    await client.query(
+      'UPDATE billing_cycles SET status = $1, paid_at = $2, paid_amount = $3, updated_at = NOW() WHERE id = $4',
+      ['paid', paymentDate, amount, id]
+    );
+
+    // Register in order_payments (reusing the payments infrastructure)
+    // We create a synthetic "order" for the subscription billing
+    // Actually, let's keep it clean: create a cash_movement directly
+    // First, find or create a cash session
+    let sessionId = null;
+    const { rows: sessRows } = await client.query(
+      "SELECT id FROM cash_sessions WHERE user_id = $1 AND status = 'open' AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
+      [req.user.id]
+    );
+    if (sessRows.length > 0) sessionId = sessRows[0].id;
+
+    if (sessionId) {
+      // Get payment method financial account
+      const { rows: pmRows } = await client.query(
+        'SELECT financial_account_id FROM payment_methods WHERE id = $1 AND deleted_at IS NULL',
+        [payment_method_id]
+      );
+      const finAccId = pmRows[0]?.financial_account_id || null;
+
+      await client.query(
+        'INSERT INTO cash_movements (session_id, client_id, created_by, session_type, financial_account_id, type, reason, amount, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+        [sessionId, req.user.client_id, req.user.id, 'cash', finAccId, 'in', 'subscription_payment', amount, paymentDate]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true, billing_cycle_id: id, paid_amount: amount });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error paying billing cycle:', err);
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    res.status(500).json({ error: 'Error al registrar pago' });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/billing/overview — dashboard summary (upcoming, overdue, active subs)
+app.get('/api/billing/overview', authenticate, async (req, res) => {
+  try {
+    const [activeSubs, overdueCycles, upcomingCycles, monthlyRevenue] = await Promise.all([
+      pool.query("SELECT COUNT(*) AS count FROM subscriptions WHERE client_id = $1 AND deleted_at IS NULL AND status = 'active'", [req.user.client_id]),
+      pool.query("SELECT COUNT(*) AS count, COALESCE(SUM(amount), 0) AS total FROM billing_cycles WHERE client_id = $1 AND deleted_at IS NULL AND status IN ('pending','overdue') AND due_date < NOW()", [req.user.client_id]),
+      pool.query("SELECT COUNT(*) AS count, COALESCE(SUM(amount), 0) AS total FROM billing_cycles WHERE client_id = $1 AND deleted_at IS NULL AND status = 'pending' AND due_date >= NOW() AND due_date < NOW() + INTERVAL '30 days'", [req.user.client_id]),
+      pool.query("SELECT COALESCE(SUM(amount), 0) AS total FROM billing_cycles WHERE client_id = $1 AND deleted_at IS NULL AND status = 'paid' AND paid_at >= NOW() - INTERVAL '30 days'", [req.user.client_id])
+    ]);
+
+    res.json({
+      active_subscriptions: Number(activeSubs.rows[0].count),
+      overdue_cycles: Number(overdueCycles.rows[0].count),
+      overdue_total: Number(overdueCycles.rows[0].total),
+      upcoming_cycles: Number(upcomingCycles.rows[0].count),
+      upcoming_total: Number(upcomingCycles.rows[0].total),
+      monthly_revenue: Number(monthlyRevenue.rows[0].total)
+    });
+  } catch (err) {
+    console.error('Error fetching billing overview:', err);
+    res.status(500).json({ error: 'Error al obtener resumen' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`[req.user.client_id, name, is_active !== false, sort_order || 0, has_delivery === true]🚀 VIB3.ia Backend running on http://localhost:${PORT}`);
   console.log(`   Database: ${process.env.DATABASE_URL ? 'configured' : 'NOT CONFIGURED'}`);
