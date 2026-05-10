@@ -1122,6 +1122,189 @@ app.delete('/api/contacts/:id', authenticate, async (req, res) => {
   }
 });
 
+
+// ─── CONTACT 360 ─────────────────────────────────────────────────
+app.get('/api/contacts/:id/360', authenticate, async (req, res) => {
+  try {
+    const cid = parseInt(req.params.id);
+    const clientId = req.user.client_id;
+    if (!cid) return res.status(400).json({ error: 'Contact ID requerido' });
+
+    // 1. Datos del contacto
+    const contact = (await pool.query(
+      `SELECT c.*, e.name as entity_name FROM contacts c LEFT JOIN entities e ON c.entity_id = e.id WHERE c.id = $1 AND c.client_id = $2 AND c.deleted_at IS NULL`,
+      [cid, clientId]
+    )).rows[0];
+    if (!contact) return res.status(404).json({ error: 'Contacto no encontrado' });
+
+    // 2. Órdenes del contacto
+    const orders = (await pool.query(
+      `SELECT o.*, os.name as status_name, ps.name as payment_status_name
+       FROM orders o
+       LEFT JOIN order_statuses os ON o.order_status_id = os.id
+       LEFT JOIN payment_statuses ps ON o.payment_status_id = ps.id
+       WHERE o.contact_id = $1 AND o.client_id = $2 AND o.deleted_at IS NULL
+       ORDER BY o.created_at DESC`,
+      [cid, clientId]
+    )).rows;
+
+    // 3. Pagos (a través de order_payments)
+    const payments = (await pool.query(
+      `SELECT op.*, pm.name as payment_method_name, o.order_number
+       FROM order_payments op
+       JOIN orders o ON op.order_id = o.id
+       LEFT JOIN payment_methods pm ON op.payment_method_id = pm.id
+       WHERE o.contact_id = $1 AND o.client_id = $2 AND op.deleted_at IS NULL
+       ORDER BY op.paid_at DESC`,
+      [cid, clientId]
+    )).rows;
+
+    // 4. Movimientos de caja vinculados
+    const cashMovements = (await pool.query(
+      `SELECT cm.*, u.name as created_by_name FROM cash_movements cm
+       LEFT JOIN users u ON cm.created_by = u.id
+       WHERE cm.contact_id = $1 AND cm.client_id = $2
+       ORDER BY cm.created_at DESC`,
+      [cid, clientId]
+    )).rows;
+
+    // 5. Productos más comprados
+    const topProducts = (await pool.query(
+      `SELECT oi.product_id, oi.product_name, SUM(oi.quantity) as total_qty, SUM(oi.subtotal) as total_spent
+       FROM order_items oi
+       JOIN orders o ON oi.order_id = o.id
+       WHERE o.contact_id = $1 AND o.client_id = $2 AND o.deleted_at IS NULL AND oi.deleted_at IS NULL
+       GROUP BY oi.product_id, oi.product_name
+       ORDER BY total_qty DESC
+       LIMIT 10`,
+      [cid, clientId]
+    )).rows;
+
+    // 6. Timeline de actividad (unifica ordenes + pagos + notas)
+    const timelineQuery = `
+      SELECT 'order' as event_type, id, o.order_number as title, o.created_at as event_at, o.total as amount, o.status_name
+      FROM (
+        SELECT o.id, o.order_number, o.created_at, o.total, os.name as status_name
+        FROM orders o LEFT JOIN order_statuses os ON o.order_status_id = os.id
+        WHERE o.contact_id = $1 AND o.client_id = $2 AND o.deleted_at IS NULL
+      ) o
+      UNION ALL
+      SELECT 'payment' as event_type, op.id, ('Pago ' || o.order_number) as title, op.paid_at as event_at, op.amount, pm.name as status_name
+      FROM order_payments op
+      JOIN orders o ON op.order_id = o.id
+      LEFT JOIN payment_methods pm ON op.payment_method_id = pm.id
+      WHERE o.contact_id = $1 AND o.client_id = $2 AND op.deleted_at IS NULL
+      UNION ALL
+      SELECT 'note' as event_type, cn.id, cn.content as title, cn.created_at as event_at, NULL as amount, cn.created_by_name as status_name
+      FROM contact_notes cn
+      WHERE cn.contact_id = $1 AND cn.client_id = $2 AND cn.deleted_at IS NULL
+      ORDER BY event_at DESC
+      LIMIT 50
+    `;
+    const timeline = (await pool.query(timelineQuery, [cid, clientId])).rows;
+
+    // 7. Notas
+    const notes = (await pool.query(
+      `SELECT * FROM contact_notes WHERE contact_id = $1 AND client_id = $2 AND deleted_at IS NULL ORDER BY created_at DESC`,
+      [cid, clientId]
+    )).rows;
+
+    // 8. Estadísticas expandidas
+    const statsRow = (await pool.query(
+      `SELECT
+        COUNT(DISTINCT o.id) as total_orders,
+        COALESCE(SUM(o.total), 0) as total_spent,
+        COALESCE((SELECT SUM(op.amount) FROM order_payments op JOIN orders o2 ON op.order_id = o2.id WHERE o2.contact_id = $1 AND o2.client_id = $2 AND op.deleted_at IS NULL), 0) as total_paid,
+        COALESCE(AVG(o.total), 0) as avg_ticket,
+        MAX(o.created_at) as last_order_date,
+        COUNT(DISTINCT oi.product_id) as unique_products_bought
+       FROM orders o
+       LEFT JOIN order_items oi ON oi.order_id = o.id AND oi.deleted_at IS NULL
+       WHERE o.contact_id = $1 AND o.client_id = $2 AND o.deleted_at IS NULL`,
+      [cid, clientId]
+    )).rows[0];
+
+    const totalSpent = parseFloat(statsRow.total_spent) || 0;
+    const totalPaid = parseFloat(statsRow.total_paid) || 0;
+    const balance = totalSpent - totalPaid;
+
+    res.json({
+      contact,
+      orders,
+      payments,
+      cash_movements: cashMovements,
+      top_products: topProducts,
+      notes,
+      timeline,
+      stats: {
+        total_orders: parseInt(statsRow.total_orders) || 0,
+        total_spent: totalSpent,
+        total_paid: totalPaid,
+        balance: balance,
+        avg_ticket: parseFloat(statsRow.avg_ticket) || 0,
+        last_order_date: statsRow.last_order_date,
+        unique_products_bought: parseInt(statsRow.unique_products_bought) || 0
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ─── CONTACT NOTES CRUD ────────────────────────────────────────────
+app.get('/api/contacts/:id/notes', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM contact_notes WHERE contact_id = $1 AND client_id = $2 AND deleted_at IS NULL ORDER BY created_at DESC`,
+      [req.params.id, req.user.client_id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/contacts/:id/notes', authenticate, async (req, res) => {
+  try {
+    const { content } = req.body;
+    if (!content) return res.status(400).json({ error: 'Content requerido' });
+    const result = await pool.query(
+      `INSERT INTO contact_notes (contact_id, client_id, content, created_by, created_by_name)
+       VALUES ($1, $2, $3, $4, COALESCE($5, $6)) RETURNING *`,
+      [req.params.id, req.user.client_id, content, req.user.id, req.user.name, req.user.username]
+    );
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/contacts/:contactId/notes/:noteId', authenticate, async (req, res) => {
+  try {
+    const { content } = req.body;
+    if (!content) return res.status(400).json({ error: 'Content requerido' });
+    const result = await pool.query(
+      `UPDATE contact_notes SET content = $1, updated_at = NOW() WHERE id = $2 AND contact_id = $3 AND client_id = $4 AND deleted_at IS NULL RETURNING *`,
+      [content, req.params.noteId, req.params.contactId, req.user.client_id]
+    );
+    res.json(result.rows[0] || { error: 'Nota no encontrada' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/contacts/:contactId/notes/:noteId', authenticate, async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE contact_notes SET deleted_at = NOW() WHERE id = $1 AND contact_id = $2 AND client_id = $3 AND deleted_at IS NULL`,
+      [req.params.noteId, req.params.contactId, req.user.client_id]
+    );
+    res.json({ message: 'Nota eliminada' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ─── SALE CHANNELS ────────────────────────────────────────────────
 app.get('/api/sale-channels', authenticate, async (req, res) => {
   try {
