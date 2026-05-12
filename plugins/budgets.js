@@ -1,4 +1,6 @@
 // Plugin: Presupuestos (Budgets)
+const PDFDocument = require('pdfkit');
+
 module.exports = function(app, pool, authenticate) {
 
   async function getNextBudgetNumber(clientId) {
@@ -260,41 +262,136 @@ module.exports = function(app, pool, authenticate) {
   app.get('/api/budgets/:id/pdf', authenticate, async (req, res) => {
     try {
       const { rows } = await pool.query(
-        "SELECT b.*, c.name as client_name, c.phone as client_phone, c.email as client_email, c.address as client_address FROM budgets b LEFT JOIN contacts c ON b.contact_id = c.id WHERE b.id = $1",
-        [req.params.id]
+        "SELECT b.*, c.name as client_name, c.phone as client_phone, c.email as client_email, c.address as client_address FROM budgets b LEFT JOIN contacts c ON b.contact_id = c.id WHERE b.id = $1 AND b.client_id = $2",
+        [req.params.id, req.user.client_id]
       );
       if (!rows[0]) return res.status(404).json({ error: 'Presupuesto no encontrado' });
       const budget = rows[0];
 
-      const items = await pool.query(
-        "SELECT bi.*, p.name as product_name, s.name as service_name FROM budget_items bi LEFT JOIN products p ON bi.product_id = p.id LEFT JOIN services s ON bi.service_id = s.id WHERE bi.budget_id = $1",
+      const { rows: items } = await pool.query(
+        "SELECT bi.*, p.name as product_name, s.name as service_name FROM budget_items bi LEFT JOIN products p ON bi.product_id = p.id LEFT JOIN services s ON bi.service_id = s.id WHERE bi.budget_id = $1 ORDER BY bi.id",
         [req.params.id]
       );
 
-      const { rows: designRows } = await pool.query('SELECT * FROM budget_designs WHERE client_id = $1', [budget.client_id]);
+      const { rows: designRows } = await pool.query('SELECT * FROM budget_designs WHERE client_id = $1', [req.user.client_id]);
       const design = designRows[0] || {};
+      const { rows: clientRows } = await pool.query('SELECT name, logo_url, address, phone, whatsapp, email, city, web_url FROM clients WHERE id = $1', [req.user.client_id]);
+      const business = clientRows[0] || { name: 'VIB3 Retail' };
 
-      const itemsHtml = items.rows.map(item => {
-        const name = item.product_name || item.service_name || item.description || '';
-        const qty = Number(item.quantity).toFixed(2);
-        const price = Number(item.unit_price).toFixed(2);
-        const sub = Number(item.subtotal).toFixed(2);
-        return '<tr><td style="padding:8px;border-bottom:1px solid #eee">' + name + '</td><td style="padding:8px;border-bottom:1px solid #eee;text-align:right">' + qty + '</td><td style="padding:8px;border-bottom:1px solid #eee;text-align:right">$' + price + '</td><td style="padding:8px;border-bottom:1px solid #eee;text-align:right">$' + sub + '</td></tr>';
-      }).join('');
+      const color = /^#[0-9a-fA-F]{6}$/.test(design.primary_color || '') ? design.primary_color : '#6c63ff';
+      const showPrices = design.show_prices !== false;
+      const money = (n) => '$' + Number(n || 0).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const date = (v) => v ? new Date(v).toLocaleDateString('es-AR') : '—';
+      const safe = (v) => (v === null || v === undefined || v === '') ? '—' : String(v);
 
-      const color = design.primary_color || '#6c63ff';
-      const fecha = new Date(budget.created_at).toLocaleDateString('es-AR');
-      const vence = budget.valid_until ? new Date(budget.valid_until).toLocaleDateString('es-AR') : 'Sin vencimiento';
-      const contacto = budget.client_name || '';
-      const subtotal = Number(budget.subtotal).toFixed(2);
-      const descuento = Number(budget.discount).toFixed(2);
-      const total = Number(budget.total).toFixed(2);
+      const doc = new PDFDocument({ size: 'A4', margin: 42, bufferPages: true });
+      const chunks = [];
+      doc.on('data', chunk => chunks.push(chunk));
+      doc.on('end', () => {
+        const pdf = Buffer.concat(chunks);
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', 'attachment; filename="Presupuesto-' + budget.number + '.pdf"');
+        res.setHeader('Content-Length', pdf.length);
+        res.send(pdf);
+      });
 
-      const defaultTemplate = '<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><style>body{font-family:Arial,sans-serif;margin:40px;color:#333}.header{text-align:center;margin-bottom:30px;border-bottom:3px solid ' + color + ';padding-bottom:20px}.header h1{color:' + color + ';margin:0 0 5px;font-size:24px}.header h2{margin:0;font-size:16px;font-weight:normal;color:#666}.meta{display:flex;justify-content:space-between;margin:20px 0}.meta-box{background:#f9f9f9;padding:12px 16px;border-radius:8px;border-left:4px solid ' + color + ';flex:1;margin:0 4px}.meta-box p{margin:4px 0;font-size:13px}table{width:100%;border-collapse:collapse;margin:20px 0}th{background:' + color + ';color:#fff;padding:10px 8px;text-align:left;font-size:12px}td{font-size:13px}.totals{margin-top:20px;text-align:right}.totals p{margin:4px 0;font-size:14px}.totals .total{font-size:20px;font-weight:bold;color:' + color + '}.footer{margin-top:40px;text-align:center;font-size:11px;color:#999;border-top:1px solid #eee;padding-top:12px}.notes{background:#fff8e1;padding:10px 14px;border-radius:6px;margin:16px 0;font-size:13px}</style></head><body><div class="header"><h1>PRESUPUESTO</h1><h2>' + budget.number + '</h2></div><div class="meta"><div class="meta-box"><p><strong>Cliente:</strong> ' + contacto + '</p><p><strong>Fecha:</strong> ' + fecha + '</p></div><div class="meta-box"><p><strong>Validez:</strong> ' + vence + '</p><p><strong>Estado:</strong> ' + (budget.status || '').toUpperCase() + '</p></div></div><table><thead><tr><th>Descripcion</th><th style="text-align:right">Cantidad</th><th style="text-align:right">Precio Unit.</th><th style="text-align:right">Subtotal</th></tr></thead><tbody>' + itemsHtml + '</tbody></table><div class="totals"><p>Subtotal: $' + subtotal + '</p><p>Descuento: -$' + descuento + '</p><p class="total">TOTAL: $' + total + '</p></div>' + (budget.notes ? '<div class="notes"><strong>Notas:</strong> ' + budget.notes + '</div>' : '') + '<div class="footer">' + (design.footer_text || '') + '</div></body></html>';
+      const pageWidth = doc.page.width;
+      const left = doc.page.margins.left;
+      const right = pageWidth - doc.page.margins.right;
+      const contentWidth = right - left;
 
-      res.setHeader('Content-Type', 'text/html');
-      res.setHeader('Content-Disposition', 'inline; filename="Presupuesto-' + budget.number + '.html"');
-      res.send(defaultTemplate);
+      // Header
+      doc.rect(0, 0, pageWidth, 95).fill(color);
+      doc.fillColor('#ffffff').fontSize(23).font('Helvetica-Bold').text('PRESUPUESTO', left, 28, { width: contentWidth / 2 });
+      doc.fontSize(12).font('Helvetica').text(budget.number, left, 58);
+      doc.fontSize(18).font('Helvetica-Bold').text(safe(business.name), left + contentWidth / 2, 28, { width: contentWidth / 2, align: 'right' });
+      doc.fontSize(9).font('Helvetica').text([business.address, business.phone || business.whatsapp, business.email, business.web_url].filter(Boolean).join(' · '), left + contentWidth / 2, 53, { width: contentWidth / 2, align: 'right' });
+
+      // Meta boxes
+      let y = 120;
+      const boxW = (contentWidth - 16) / 2;
+      doc.fillColor('#111827').fontSize(11).font('Helvetica-Bold').text('Datos del cliente', left, y);
+      doc.fontSize(11).text('Datos del presupuesto', left + boxW + 16, y);
+      y += 18;
+      doc.roundedRect(left, y, boxW, 92, 8).fillAndStroke('#f8fafc', '#e5e7eb');
+      doc.roundedRect(left + boxW + 16, y, boxW, 92, 8).fillAndStroke('#f8fafc', '#e5e7eb');
+      doc.fillColor('#374151').fontSize(10).font('Helvetica');
+      doc.text('Cliente: ' + safe(budget.client_name), left + 12, y + 13, { width: boxW - 24 });
+      doc.text('Teléfono: ' + safe(budget.client_phone), left + 12, y + 31, { width: boxW - 24 });
+      doc.text('Email: ' + safe(budget.client_email), left + 12, y + 49, { width: boxW - 24 });
+      doc.text('Dirección: ' + safe(budget.client_address), left + 12, y + 67, { width: boxW - 24 });
+      doc.text('Número: ' + budget.number, left + boxW + 28, y + 13, { width: boxW - 24 });
+      doc.text('Fecha: ' + date(budget.created_at), left + boxW + 28, y + 31, { width: boxW - 24 });
+      doc.text('Estado: ' + String(budget.status || 'pendiente').toUpperCase(), left + boxW + 28, y + 49, { width: boxW - 24 });
+      doc.text('Validez: ' + (budget.valid_until ? date(budget.valid_until) : 'Sin vencimiento'), left + boxW + 28, y + 67, { width: boxW - 24 });
+
+      // Items table
+      y += 120;
+      const cols = showPrices
+        ? { desc: left, qty: left + 295, unit: left + 365, sub: left + 455 }
+        : { desc: left, qty: left + 420 };
+      const rowH = 28;
+      doc.roundedRect(left, y, contentWidth, rowH, 6).fill(color);
+      doc.fillColor('#ffffff').fontSize(10).font('Helvetica-Bold');
+      doc.text('Descripción', cols.desc + 10, y + 9, { width: showPrices ? 270 : 390 });
+      doc.text('Cant.', cols.qty, y + 9, { width: 55, align: 'right' });
+      if (showPrices) {
+        doc.text('P. Unit.', cols.unit, y + 9, { width: 70, align: 'right' });
+        doc.text('Subtotal', cols.sub, y + 9, { width: 65, align: 'right' });
+      }
+      y += rowH;
+
+      doc.font('Helvetica').fontSize(9);
+      items.forEach((item, idx) => {
+        if (y > 720) {
+          doc.addPage();
+          y = 50;
+        }
+        const bg = idx % 2 === 0 ? '#ffffff' : '#f9fafb';
+        doc.rect(left, y, contentWidth, rowH).fill(bg).stroke('#eef2f7');
+        const name = item.product_name || item.service_name || item.description || 'Item';
+        doc.fillColor('#111827').text(name, cols.desc + 10, y + 9, { width: showPrices ? 270 : 390, ellipsis: true });
+        doc.fillColor('#374151').text(Number(item.quantity || 0).toLocaleString('es-AR'), cols.qty, y + 9, { width: 55, align: 'right' });
+        if (showPrices) {
+          doc.text(money(item.unit_price), cols.unit, y + 9, { width: 70, align: 'right' });
+          doc.font('Helvetica-Bold').text(money(item.subtotal), cols.sub, y + 9, { width: 65, align: 'right' }).font('Helvetica');
+        }
+        y += rowH;
+      });
+
+      // Totals
+      y += 18;
+      if (y > 690) { doc.addPage(); y = 60; }
+      const totalsX = right - 210;
+      doc.fillColor('#111827').fontSize(10).font('Helvetica');
+      if (showPrices) {
+        doc.text('Subtotal', totalsX, y, { width: 95 });
+        doc.text(money(budget.subtotal), totalsX + 95, y, { width: 115, align: 'right' });
+        y += 20;
+        doc.text('Descuento', totalsX, y, { width: 95 });
+        doc.text('-' + money(budget.discount), totalsX + 95, y, { width: 115, align: 'right' });
+        y += 24;
+        doc.moveTo(totalsX, y - 8).lineTo(right, y - 8).stroke('#e5e7eb');
+        doc.fillColor(color).fontSize(15).font('Helvetica-Bold').text('TOTAL', totalsX, y, { width: 95 });
+        doc.text(money(budget.total), totalsX + 95, y, { width: 115, align: 'right' });
+        y += 32;
+      }
+
+      if (budget.notes) {
+        doc.fillColor('#111827').fontSize(10).font('Helvetica-Bold').text('Notas', left, y);
+        y += 14;
+        doc.fillColor('#374151').font('Helvetica').fontSize(9).text(String(budget.notes), left, y, { width: contentWidth });
+        y += 32;
+      }
+
+      // Validity/footer
+      const footerY = Math.max(y + 20, 760);
+      doc.moveTo(left, footerY).lineTo(right, footerY).stroke('#e5e7eb');
+      doc.fillColor('#6b7280').fontSize(9).font('Helvetica')
+        .text('Validez del presupuesto: ' + (budget.valid_until ? date(budget.valid_until) : 'sin vencimiento especificado'), left, footerY + 12, { width: contentWidth / 2 });
+      doc.text(design.footer_text || 'Presupuesto sujeto a disponibilidad y confirmación.', left + contentWidth / 2, footerY + 12, { width: contentWidth / 2, align: 'right' });
+
+      doc.end();
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
