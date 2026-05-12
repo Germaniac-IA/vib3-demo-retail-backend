@@ -43,10 +43,9 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }))
 app.use(function(err,req,res,next){if(err instanceof SyntaxError){console.error('JSON parse error');res.status(400).json({error:'Invalid JSON'});}next(err);});
 
-// ─── GLOBAL MIDDLEWARE: Agent API Key (runs before every request) ──
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.use(agentAuth);
 
-// ─── MIDDLEWARE: Agent API Key Auth ──────────────────────────────
 async function agentAuth(req, res, next) {
   const agentKey = req.headers['x-agent-key'];
   if (!agentKey) return next(); // No agent key, continue to JWT auth
@@ -69,7 +68,7 @@ async function agentAuth(req, res, next) {
   }
 }
 
-// ─── MIDDLEWARE: Auth (JWT) ─────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 async function authenticate(req, res, next) {
   // Already authenticated via agent API key?
   if (req.user && req.user.is_agent) return next();
@@ -124,7 +123,7 @@ function parseJsonOrNull(value) {
 }
 
 
-// ─── HELPER: getProductStockConfig ────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 async function getProductStockConfig(clientId, productId) {
   const { rows } = await pool.query(
     'SELECT at.id as attribute_type_id, at.name as attribute_type_name, av.id as attribute_value_id, av.value as attribute_value_name, pa.stock_quantity ' +
@@ -154,7 +153,7 @@ async function getProductStockConfig(clientId, productId) {
   return { hasAttributes: true, has_attributes: true, requires_stock: true, attributeTypes: Object.values(attributeTypes) };
 }
 
-// ─── HELPER: adjustInventoryStock ────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 async function adjustInventoryStock(client, params) {
   const { productId, attributeValueId, quantity, increase = true } = params;
   const qty = Number(quantity || 0);
@@ -174,7 +173,7 @@ async function adjustInventoryStock(client, params) {
   }
 }
 
-// ─── HELPER: recalculate order operational status from item fulfillment ─────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 async function recalculateOrderOperationalStatus(client, orderId, clientId) {
   const { rows: items } = await client.query(
     "SELECT fulfillment_status FROM order_items WHERE order_id = $1 AND deleted_at IS NULL",
@@ -202,7 +201,7 @@ async function recalculateOrderOperationalStatus(client, orderId, clientId) {
   }
 }
 
-// ─── HEALTH ────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
@@ -212,7 +211,7 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-// ─── AUTH ──────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -266,7 +265,7 @@ app.get('/api/auth/me', authenticate, async (req, res) => {
   }
 });
 
-// ─── CLIENTS ───────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/clients', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM clients ORDER BY name');
@@ -315,7 +314,7 @@ app.put('/api/clients/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── FISCAL DATA ────────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/fiscal-data/:clientId', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM fiscal_data WHERE deleted_at IS NULL AND client_id = $1', [req.params.clientId]);
@@ -346,7 +345,7 @@ app.put('/api/fiscal-data/:clientId', authenticate, async (req, res) => {
   }
 });
 
-// ─── USERS ─────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/users', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT id, client_id, username, name, email, phone, telegram_id, rol, is_active, created_at FROM users WHERE deleted_at IS NULL AND client_id = $1 ORDER BY name', [req.user.client_id]);
@@ -400,7 +399,7 @@ app.delete('/api/users/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── AGENTS ────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/agents', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM agents WHERE deleted_at IS NULL AND client_id = $1 ORDER BY name', [req.user.client_id]);
@@ -462,7 +461,7 @@ app.delete('/api/agents/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── AGENT CAPABILITIES ────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/agent-capabilities', authenticate, async (req, res) => {
   try {
     const clientId = req.query.client_id || req.user.client_id;
@@ -481,7 +480,7 @@ app.get('/api/agent-capabilities', authenticate, async (req, res) => {
   }
 });
 
-// ─── AGENT INSTRUCTIONS ───────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/agent-instructions', authenticate, async (req, res) => {
   try {
     const agentId = req.query.agent_id || req.user.client_id;
@@ -536,7 +535,7 @@ app.delete('/api/agent-instructions/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── AGENT PROCEDURES ───────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/agent-procedures', authenticate, async (req, res) => {
   try {
     const agentId = req.query.agent_id || req.user.client_id;
@@ -607,7 +606,7 @@ app.delete('/api/agent-procedures/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── PAYMENT METHODS ───────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/payment-methods', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM payment_methods WHERE deleted_at IS NULL AND client_id = $1 ORDER BY sort_order', [req.user.client_id]);
@@ -618,22 +617,38 @@ app.get('/api/payment-methods', authenticate, async (req, res) => {
 });
 
 app.post('/api/payment-methods', authenticate, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { name, is_personal, is_cash, cbu_cvu, alias, banco, sort_order } = req.body;
-    const result = await pool.query(
-      'INSERT INTO payment_methods (client_id, name, is_personal, is_cash, cbu_cvu, alias, banco, sort_order) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-      [req.user.client_id, name, is_personal || false, is_cash !== false, cbu_cvu || null, alias || null, banco || null, sort_order || 0]
+    const { name, is_personal, is_cash, cbu_cvu, alias, banco, sort_order, generates_payment_link, integration_provider, integration_label } = req.body;
+    await client.query('BEGIN');
+    const provider = generates_payment_link ? (integration_provider || 'mercadopago') : null;
+    if (generates_payment_link && provider) {
+      await client.query('UPDATE payment_methods SET generates_payment_link = false, integration_provider = NULL, integration_label = NULL, updated_at = NOW() WHERE client_id = $1 AND integration_provider = $2 AND deleted_at IS NULL', [req.user.client_id, provider]);
+    }
+    const result = await client.query(
+      'INSERT INTO payment_methods (client_id, name, is_personal, is_cash, cbu_cvu, alias, banco, sort_order, generates_payment_link, integration_provider, integration_label) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *',
+      [req.user.client_id, name, is_personal || false, is_cash !== false, cbu_cvu || null, alias || null, banco || null, sort_order || 0, Boolean(generates_payment_link), provider, integration_label || (provider === 'mercadopago' ? 'Mercado Pago' : provider)]
     );
+    await client.query('COMMIT');
     res.status(201).json(result.rows[0]);
   } catch (error) {
+    await client.query('ROLLBACK');
     res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
   }
 });
 
 app.put('/api/payment-methods/:id', authenticate, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { name, is_personal, is_cash, cbu_cvu, alias, banco, is_active, sort_order } = req.body;
-    const result = await pool.query(
+    const { name, is_personal, is_cash, cbu_cvu, alias, banco, is_active, sort_order, generates_payment_link, integration_provider, integration_label } = req.body;
+    await client.query('BEGIN');
+    const provider = generates_payment_link ? (integration_provider || 'mercadopago') : null;
+    if (generates_payment_link && provider) {
+      await client.query('UPDATE payment_methods SET generates_payment_link = false, integration_provider = NULL, integration_label = NULL, updated_at = NOW() WHERE client_id = $1 AND integration_provider = $2 AND id <> $3 AND deleted_at IS NULL', [req.user.client_id, provider, req.params.id]);
+    }
+    const result = await client.query(
       `UPDATE payment_methods SET 
         name=COALESCE($1,name), 
         is_personal=COALESCE($2,is_personal), 
@@ -643,13 +658,20 @@ app.put('/api/payment-methods/:id', authenticate, async (req, res) => {
         banco=COALESCE($6,banco), 
         is_active=COALESCE($7,is_active), 
         sort_order=COALESCE($8,sort_order), 
+        generates_payment_link=COALESCE($9,generates_payment_link),
+        integration_provider=$10,
+        integration_label=$11,
         updated_at=NOW() 
-       WHERE id=$9 AND client_id=$10 RETURNING *`,
-      [name, is_personal, is_cash, cbu_cvu, alias, banco, is_active, sort_order, req.params.id, req.user.client_id]
+       WHERE id=$12 AND client_id=$13 RETURNING *`,
+      [name, is_personal, is_cash, cbu_cvu, alias, banco, is_active, sort_order, generates_payment_link, provider, generates_payment_link ? (integration_label || (provider === 'mercadopago' ? 'Mercado Pago' : provider)) : null, req.params.id, req.user.client_id]
     );
+    await client.query('COMMIT');
     res.json(result.rows[0] || null);
   } catch (error) {
+    await client.query('ROLLBACK');
     res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -662,7 +684,7 @@ app.delete('/api/payment-methods/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── PRODUCT CATEGORIES ─────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/product-categories', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM product_categories WHERE deleted_at IS NULL AND client_id = $1 ORDER BY sort_order', [req.user.client_id]);
@@ -712,7 +734,7 @@ app.delete('/api/product-categories/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── PRODUCT BRANDS ────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/product-brands', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM product_brands WHERE deleted_at IS NULL AND client_id = $1 ORDER BY name', [req.user.client_id]);
@@ -763,7 +785,7 @@ app.delete('/api/product-brands/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── PRODUCTS ──────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/products', authenticate, async (req, res) => {
   try {
     const includeDiscontinued = req.headers['x-include-discontinued'] === '1' || req.query.include_discontinued === 'true';
@@ -878,7 +900,7 @@ app.delete('/api/products/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── INPUT ITEMS (insumos) ─────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/input-items', authenticate, async (req, res) => {
   try {
     const { q = '' } = req.query;
@@ -927,7 +949,7 @@ app.delete('/api/input-items/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── PRODUCT INPUT COMPONENTS ─────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/products/:id/components', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1019,7 +1041,7 @@ app.delete('/api/products/:productId/components/:componentId', authenticate, asy
   }
 });
 
-// ─── UPDATE COSTS (products + input-items) ──────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.post('/api/products/update-costs', authenticate, async (req, res) => {
   try {
     const { productIds = [], newCostPrice, increasePercent, increaseAmount } = req.body;
@@ -1075,7 +1097,7 @@ app.post('/api/input-items/update-costs', authenticate, async (req, res) => {
 
 
 
-// ─── UPDATE PRICES ─────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 // POST /api/services/update-prices — update service prices (single = newPrice, multi = % or $)
 app.post('/api/services/update-prices', authenticate, async (req, res) => {
   try {
@@ -1089,7 +1111,7 @@ app.post('/api/services/update-prices', authenticate, async (req, res) => {
         "UPDATE services SET price = $1, updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id",
         [Number(newPrice) || 0, req.user.client_id, ids]
       );
-      return res.json({ success: true, updated: rows.length });
+      return res.json({ success: true, updated: result.rows.length });
     }
 
     if (increasePercent !== undefined && increasePercent !== null) {
@@ -1097,7 +1119,7 @@ app.post('/api/services/update-prices', authenticate, async (req, res) => {
         "UPDATE services SET price = ROUND(price * (1 + $1::numeric / 100)), updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id",
         [Number(increasePercent) || 0, req.user.client_id, ids]
       );
-      return res.json({ success: true, updated: rows.length });
+      return res.json({ success: true, updated: result.rows.length });
     }
 
     if (increaseAmount !== undefined && increaseAmount !== null) {
@@ -1105,7 +1127,7 @@ app.post('/api/services/update-prices', authenticate, async (req, res) => {
         "UPDATE services SET price = price + $1, updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id",
         [Number(increaseAmount) || 0, req.user.client_id, ids]
       );
-      return res.json({ success: true, updated: rows.length });
+      return res.json({ success: true, updated: result.rows.length });
     }
 
     return res.status(400).json({ error: 'Falta newPrice, increasePercent o increaseAmount' });
@@ -1124,7 +1146,7 @@ app.post('/api/products/update-prices', authenticate, async (req, res) => {
         `UPDATE products SET price = $1, updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id`,
         [Number(newPrice) || 0, req.user.client_id, ids]
       );
-      return res.json({ success: true, updated: rows.length });
+      return res.json({ success: true, updated: result.rows.length });
     }
 
     if (increasePercent !== undefined && increasePercent !== null) {
@@ -1132,7 +1154,7 @@ app.post('/api/products/update-prices', authenticate, async (req, res) => {
         `UPDATE products SET price = ROUND(price * (1 + $1::numeric / 100)), updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id`,
         [Number(increasePercent) || 0, req.user.client_id, ids]
       );
-      return res.json({ success: true, updated: rows.length });
+      return res.json({ success: true, updated: result.rows.length });
     }
 
     if (increaseAmount !== undefined && increaseAmount !== null) {
@@ -1140,7 +1162,7 @@ app.post('/api/products/update-prices', authenticate, async (req, res) => {
         `UPDATE products SET price = price + $1, updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id`,
         [Number(increaseAmount) || 0, req.user.client_id, ids]
       );
-      return res.json({ success: true, updated: rows.length });
+      return res.json({ success: true, updated: result.rows.length });
     }
 
     return res.status(400).json({ error: 'Falta newPrice, increasePercent o increaseAmount' });
@@ -1148,9 +1170,9 @@ app.post('/api/products/update-prices', authenticate, async (req, res) => {
 });
 
 
-// ─── CONTACTS ──────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 
-// ─── CONDICIONES IVA ────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/condiciones-iva', (req, res) => {
   res.json([
     { value: 'consumidor_final', label: 'Consumidor Final' },
@@ -1206,7 +1228,7 @@ app.delete('/api/contacts/:id', authenticate, async (req, res) => {
 });
 
 
-// ─── CONTACT 360 ─────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/contacts/:id/360', authenticate, async (req, res) => {
   try {
     const cid = parseInt(req.params.id);
@@ -1369,7 +1391,7 @@ app.get('/api/contacts/:id/360', authenticate, async (req, res) => {
   }
 });
 
-// ─── CONTACT NOTES CRUD ────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/contacts/:id/notes', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1423,7 +1445,7 @@ app.delete('/api/contacts/:contactId/notes/:noteId', authenticate, async (req, r
   }
 });
 
-// ─── SALE CHANNELS ────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/sale-channels', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1463,7 +1485,7 @@ app.delete('/api/sale-channels/:id', authenticate, async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// ─── ORDER STATUSES ────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/order-statuses', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1503,7 +1525,7 @@ app.delete('/api/order-statuses/:id', authenticate, async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// ─── PAYMENT STATUSES ──────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/payment-statuses', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1543,11 +1565,11 @@ app.delete('/api/payment-statuses/:id', authenticate, async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// ─── ORDERS (VENTAS) ────────────────────────────────────────────────
-// ─── ORDERS STATS ──────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 
 
-// ─── EXPENSE CATEGORIES ───────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/expense-categories', authenticate, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -1610,7 +1632,7 @@ async function syncExpensePaymentStatus(expenseId, client = pool) {
   if (statusId) await client.query('UPDATE expenses SET payment_status_id=$1, updated_at=NOW() WHERE id=$2', [statusId, expenseId]);
 }
 
-// ─── EXPENSES ─────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/expenses', authenticate, async (req, res) => {
   try {
     const { period = 'month', from, to, date_from, date_to } = req.query;
@@ -1788,7 +1810,7 @@ app.get('/api/orders/stats', authenticate, async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// ─── DELETE ORDER (soft) ─────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 
 app.get('/api/orders', authenticate, async (req, res) => {
   try {
@@ -2157,7 +2179,7 @@ app.post('/api/orders', authenticate, async (req, res) => {
       }
     }
 
-    // ── Process client advance (inside transaction) ──
+    // ─── LEADS STATS ─────────────────────────────────────────────
     if (advance_id && Number(advance_amount) > 0) {
       const { rows: advRows } = await client.query('SELECT * FROM advances WHERE id = $1 AND deleted_at IS NULL', [advance_id]);
       if (advRows.length > 0) {
@@ -2177,7 +2199,7 @@ app.post('/api/orders', authenticate, async (req, res) => {
       }
     }
 
-    // ── Process cash payment (efectivo) ──
+    // ─── LEADS STATS ─────────────────────────────────────────────
     const cashAmount = Number(effective_cash_amount) || 0;
     if (cashAmount > 0) {
       const { rows: userRows } = await client.query("SELECT joined_session_id FROM users WHERE id = $1", [effectiveCashUserId(req)]);
@@ -2221,7 +2243,7 @@ app.post('/api/orders', authenticate, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // ── Auto-create Work Orders for services with creates_work_order ──
+    // ─── LEADS STATS ─────────────────────────────────────────────
     for (const wo of woCandidates) {
       const woTitle = wo.service_name || "Orden de Trabajo";
       await pool.query(
@@ -2230,7 +2252,7 @@ app.post('/api/orders', authenticate, async (req, res) => {
       );
     }
 
-    // ── Auto-create Design Requests for products with genera_diseno ──
+    // ─── LEADS STATS ─────────────────────────────────────────────
     try {
       for (const item of (items || [])) {
         const prodDes = await pool.query(
@@ -2519,7 +2541,7 @@ app.delete('/api/orders/:id/payments/:paymentId', authenticate, async (req, res)
   }
 });
 
-// ─── LEAD SOURCES ──────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/lead-sources', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2576,7 +2598,7 @@ app.delete('/api/lead-sources/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── LEADS ─────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/leads', authenticate, async (req, res) => {
   try {
     const result = await pool.query(`
@@ -3018,7 +3040,7 @@ app.get('/api/dashboard/owner-stats', authenticate, async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// ─── DASHBOARD SUMMARY ─────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/dashboard/summary', authenticate, async (req, res) => {
   try {
     const cid = req.user.client_id;
@@ -3049,9 +3071,9 @@ app.get('/api/dashboard/summary', authenticate, async (req, res) => {
   }
 });
 
-// ─── START ─────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 
-// ─── PRODUCT IMAGE UPLOAD ────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 
 app.post('/api/products/:id/image', authenticate, async (req, res) => {
   try {
@@ -3093,7 +3115,7 @@ app.post('/api/products/:id/image', authenticate, async (req, res) => {
   }
 });
 
-// ─── SERVE IMAGES ───────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 const imageDir = '/var/www/dash-images';
 const templateDir = '/var/www/baver/templates';
 const uploadDir = '/var/www/baver/uploads';
@@ -3105,7 +3127,7 @@ app.use('/plantillas', express.static('/var/www/baver/Plantilla clientes'));
 
 
 
-// ─── LEAD MATCH & MERGE ────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 
 // POST /api/leads/:id/verify-match
 // Checks if lead matches any existing contact by phone/whatsapp/email/instagram
@@ -3263,7 +3285,7 @@ app.delete('/api/orders/:id', authenticate, async (req, res) => {
   } finally { client.release(); }
 });
 
-// ─── ORDER ITEMS (for edit) ─────────────────────────────────// ─── ORDER ITEMS (for edit) ─────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.post('/api/orders/:id/items', authenticate, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -3448,7 +3470,7 @@ app.delete('/api/orders/:id/items/:itemId', authenticate, async (req, res) => {
 
 
 
-// ─── PRODUCTS STATS ───────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/products/stats', authenticate, async (req, res) => {
   try {
     const { period } = req.query;
@@ -3481,7 +3503,7 @@ app.get('/api/products/stats', authenticate, async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// ─── CONTACTS STATS ─────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/contacts/stats', authenticate, async (req, res) => {
   try {
     const { period } = req.query;
@@ -3510,9 +3532,183 @@ app.get('/api/contacts/stats', authenticate, async (req, res) => {
     });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
+// GET /api/products/report - exportar reporte Excel
+app.get('/api/products/report', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT p.*, pc.name AS category_name, pb.name AS brand_name
+       FROM products p
+       LEFT JOIN product_categories pc ON pc.id = p.category_id AND pc.deleted_at IS NULL
+       LEFT JOIN product_brands pb ON pb.id = p.brand_id AND pb.deleted_at IS NULL
+       WHERE p.client_id = $1 AND p.deleted_at IS NULL
+       ORDER BY p.name`,
+      [req.user.client_id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+// POST /api/products/import - importar productos desde Excel
+app.post('/api/products/import', authenticate, async (req, res) => {
+  const { products } = req.body;
+  if (!products || !Array.isArray(products) || products.length === 0) {
+    return res.status(400).json({ error: 'Se requiere un array products' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let created = 0, updated = 0;
+    const errorDetails = [];
+
+    for (const p of products) {
+      try {
+        // Lookup or create category
+        let catId = null;
+        if (p.category && p.category.trim() && p.category !== 'General') {
+          const cat = await client.query(
+            'SELECT id FROM product_categories WHERE client_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL',
+            [req.user.client_id, p.category.trim()]
+          );
+          if (cat.rows.length > 0) {
+            catId = cat.rows[0].id;
+          } else {
+            const newCat = await client.query(
+              'INSERT INTO product_categories (client_id, name) VALUES ($1, $2) RETURNING id',
+              [req.user.client_id, p.category.trim()]
+            );
+            catId = newCat.rows[0].id;
+          }
+        }
+
+        // Lookup or create brand
+        let brandId = null;
+        if (p.brand && p.brand.trim() && p.brand !== 'Generica') {
+          const br = await client.query(
+            'SELECT id FROM product_brands WHERE client_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL',
+            [req.user.client_id, p.brand.trim()]
+          );
+          if (br.rows.length > 0) {
+            brandId = br.rows[0].id;
+          } else {
+            const newBr = await client.query(
+              'INSERT INTO product_brands (client_id, name) VALUES ($1, $2) RETURNING id',
+              [req.user.client_id, p.brand.trim()]
+            );
+            brandId = newBr.rows[0].id;
+          }
+        }
+
+        const isActive = p.ACTIVO === 'Si' || p.ACTIVO === 'S' || String(p.activo || p.is_active || '').toLowerCase() === 'true' || true;
+
+        // Upsert by SKU
+        if (p.sku && p.sku.trim()) {
+          const existing = await client.query(
+            'SELECT id FROM products WHERE client_id = $1 AND sku = $2 AND deleted_at IS NULL',
+            [req.user.client_id, p.sku.trim()]
+          );
+          if (existing.rows.length > 0) {
+            await client.query(
+              `UPDATE products SET
+                name = COALESCE($1, name),
+                sku_externo = COALESCE($2, sku_externo),
+                description = COALESCE($3, description),
+                commercial_description = COALESCE($4, commercial_description),
+                price = COALESCE($5, price),
+                cost_price = COALESCE($6, cost_price),
+                unit = COALESCE($7, unit),
+                stock_quantity = COALESCE($8, stock_quantity),
+                min_stock = COALESCE($9, min_stock),
+                category_id = COALESCE($10, category_id),
+                brand_id = COALESCE($11, brand_id),
+                is_active = $12
+              WHERE id = $13`,
+              [
+                p.name || null,
+                p.codigo || p.sku_externo || null,
+                p.description || p.DESCRIPCION || null,
+                p.commercial_description || p.DESCRIPCION_COMERCIAL || null,
+                p.price != null ? p.price : null,
+                p.costo || p.cost_price || null,
+                p.unit || p.UNIDAD || null,
+                p.stock != null ? p.stock : (p.stock_quantity != null ? p.stock_quantity : null),
+                p.minimo != null ? p.minimo : (p.min_stock != null ? p.min_stock : null),
+                catId,
+                brandId,
+                isActive,
+                existing.rows[0].id
+              ]
+            );
+            updated++;
+          } else {
+            await client.query(
+              `INSERT INTO products (client_id, sku, sku_externo, name, description, commercial_description,
+                price, cost_price, unit, stock_quantity, min_stock, category_id, brand_id, is_active)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+              [
+                req.user.client_id,
+                p.sku.trim(),
+                p.codigo || p.sku_externo || '',
+                p.name || p.NOMBRE || '',
+                p.description || p.DESCRIPCION || '',
+                p.commercial_description || p.DESCRIPCION_COMERCIAL || '',
+                p.price != null ? p.price : 0,
+                p.costo || p.cost_price || 0,
+                p.unit || p.UNIDAD || 'unidad',
+                p.stock != null ? p.stock : (p.stock_quantity || 0),
+                p.minimo != null ? p.minimo : (p.min_stock || 0),
+                catId,
+                brandId,
+                isActive,
+              ]
+            );
+            created++;
+          }
+        } else {
+          // No SKU: always insert
+          await client.query(
+            `INSERT INTO products (client_id, sku, sku_externo, name, description, commercial_description,
+              price, cost_price, unit, stock_quantity, min_stock, category_id, brand_id, is_active)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+            [
+              req.user.client_id,
+              p.sku || '',
+              p.codigo || p.sku_externo || '',
+              p.name || p.NOMBRE || '',
+              p.description || p.DESCRIPCION || '',
+              p.commercial_description || p.DESCRIPCION_COMERCIAL || '',
+              p.price != null ? p.price : 0,
+              p.costo || p.cost_price || 0,
+              p.unit || p.UNIDAD || 'unidad',
+              p.stock != null ? p.stock : (p.stock_quantity || 0),
+              p.minimo != null ? p.minimo : (p.min_stock || 0),
+              catId,
+              brandId,
+              isActive,
+            ]
+          );
+          created++;
+        }
+      } catch (err) {
+        errorDetails.push({ sku: p.sku || p.NOMBRE || '?', error: err.message });
+      }
+    }
+
+    await client.query('COMMIT');
+    res.json({ created, updated, errors: errorDetails.length, errorDetails });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
 
 // ─── LEADS STATS ─────────────────────────────────────────────
-app.get('/api/leads/stats', authenticate, async (req, res) => {
+app.get("/api/leads/stats", authenticate, async (req, res) => {
   try {
     const { period } = req.query;
     let dateFilter = '';
@@ -3558,7 +3754,7 @@ app.get('/api/leads/stats', authenticate, async (req, res) => {
 });
 
 
-// ─── COBROS MODULE ────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 // Cash Sessions (Cobros)
 app.get('/api/cash-sessions', async (req, res) => {
   try {
@@ -4158,7 +4354,7 @@ app.get('/api/cash/stats', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── COMPRAS MODULE ─────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 
 // --- PROVIDERS ---
 app.get('/api/providers', async (req, res) => {
@@ -4665,7 +4861,7 @@ app.delete('/api/purchase-statuses/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── PAGOS MODULE ────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/payment-sessions', async (req, res) => {
   try {
     const { status } = req.query;
@@ -6284,7 +6480,7 @@ app.put('/api/products/:id/attributes/:attributeValueId/stock', authenticate, as
 // SUBSCRIPTIONS / PLANS / BILLING MODULE
 // ═══════════════════════════════════════════════
 
-// ─── SERVICES ───
+// ─── LEADS STATS ─────────────────────────────────────────────
 
 // GET /api/services — list all services
 app.get('/api/services', authenticate, async (req, res) => {
@@ -6511,7 +6707,7 @@ app.delete('/api/work-orders/:id', authenticate, async (req, res) => {
 });
 
 
-// ─── PLANS ───
+// ─── LEADS STATS ─────────────────────────────────────────────
 
 // GET /api/plans — list all active plans
 app.get('/api/plans', authenticate, async (req, res) => {
@@ -6577,7 +6773,7 @@ app.delete('/api/plans/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── SUBSCRIPTIONS ───
+// ─── LEADS STATS ─────────────────────────────────────────────
 
 // GET /api/subscriptions — list all active subscriptions (with contact & plan info)
 app.get('/api/subscriptions', authenticate, async (req, res) => {
@@ -6712,7 +6908,7 @@ app.delete('/api/subscriptions/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── BILLING CYCLES ───
+// ─── LEADS STATS ─────────────────────────────────────────────
 
 
 // GET /api/billing-cycles — list billing cycles with subscription/contact/plan context
@@ -7192,7 +7388,7 @@ async function devengarSingleBC(req, res, cycleId) {
   }
 }
 
-// ── Plugins ──
+// ─── LEADS STATS ─────────────────────────────────────────────
 try {
   require('./integrations')(app, pool, authenticate);
   console.log('Modulo integraciones cargado');
