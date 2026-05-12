@@ -20,6 +20,25 @@ module.exports = function(app, pool, authenticate) {
     catch (e) { res.status(500).json({ error: e.message }); }
   });
 
+  // Design config routes must be registered before /api/budgets/:id
+  app.get('/api/budgets/design', authenticate, async (req, res) => {
+    try {
+      const { rows } = await pool.query('SELECT * FROM budget_designs WHERE client_id = $1', [req.user.client_id]);
+      res.json(rows[0] || {});
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.put('/api/budgets/design', authenticate, async (req, res) => {
+    try {
+      const { template_html, logo_url, primary_color, footer_text, show_prices } = req.body;
+      const { rows } = await pool.query(
+        "INSERT INTO budget_designs (client_id, template_html, logo_url, primary_color, footer_text, show_prices) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (client_id) DO UPDATE SET template_html = EXCLUDED.template_html, logo_url = EXCLUDED.logo_url, primary_color = EXCLUDED.primary_color, footer_text = EXCLUDED.footer_text, show_prices = EXCLUDED.show_prices, updated_at = NOW() RETURNING *",
+        [req.user.client_id, template_html || '', logo_url || '', primary_color || '#6c63ff', footer_text || '', show_prices !== false]
+      );
+      res.json(rows[0]);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   app.get('/api/budgets', authenticate, async (req, res) => {
     try {
       const clientId = req.user.client_id;
@@ -31,14 +50,14 @@ module.exports = function(app, pool, authenticate) {
       const params = [clientId];
 
       if (status && status !== 'todos') { params.push(status); where += " AND b.status = $" + params.length; }
-      if (client_id) { params.push(client_id); where += " AND b.client_id = $" + params.length; }
+      if (client_id) { params.push(client_id); where += " AND b.contact_id = $" + params.length; }
       if (q) { params.push('%' + q + '%'); where += " AND (b.number ILIKE $" + params.length + " OR c.name ILIKE $" + params.length + ")"; }
 
-      const countRow = await pool.query("SELECT COUNT(*) as total FROM budgets b LEFT JOIN contacts c ON b.client_id = c.id " + where, params);
+      const countRow = await pool.query("SELECT COUNT(*) as total FROM budgets b LEFT JOIN contacts c ON b.contact_id = c.id " + where, params);
 
       params.push(limit, offset);
       const { rows } = await pool.query(
-        "SELECT b.*, c.name as client_name FROM budgets b LEFT JOIN contacts c ON b.client_id = c.id " + where + " ORDER BY b.created_at DESC LIMIT $" + (params.length - 1) + " OFFSET $" + params.length,
+        "SELECT b.*, c.name as client_name FROM budgets b LEFT JOIN contacts c ON b.contact_id = c.id " + where + " ORDER BY b.created_at DESC LIMIT $" + (params.length - 1) + " OFFSET $" + params.length,
         params
       );
 
@@ -55,9 +74,9 @@ module.exports = function(app, pool, authenticate) {
     const client = await pool.connect();
     try {
       const clientId = req.user.client_id;
-      const { client_id, items = [], notes, valid_until, discount = 0 } = req.body;
+      const { client_id: contact_id, items = [], notes, valid_until, discount = 0 } = req.body;
 
-      if (!client_id) return res.status(400).json({ error: 'client_id requerido' });
+      if (!contact_id) return res.status(400).json({ error: 'contact_id requerido' });
       if (!items.length) return res.status(400).json({ error: 'Se requiere al menos un item' });
 
       await client.query('BEGIN');
@@ -82,8 +101,8 @@ module.exports = function(app, pool, authenticate) {
       const total = Math.max(0, subtotal - Number(discount));
 
       const { rows: budgetRows } = await client.query(
-        "INSERT INTO budgets (client_id, number, subtotal, discount, total, notes, valid_until, status) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pendiente') RETURNING *",
-        [clientId, number, subtotal, Number(discount), total, notes || '', valid_until || null]
+        "INSERT INTO budgets (client_id, contact_id, number, subtotal, discount, total, notes, valid_until, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pendiente') RETURNING *",
+        [clientId, contact_id, number, subtotal, Number(discount), total, notes || '', valid_until || null]
       );
       const budget = budgetRows[0];
 
@@ -108,7 +127,7 @@ module.exports = function(app, pool, authenticate) {
   app.get('/api/budgets/:id', authenticate, async (req, res) => {
     try {
       const { rows } = await pool.query(
-        "SELECT b.*, c.name as client_name, c.phone as client_phone, c.email as client_email, c.address as client_address FROM budgets b LEFT JOIN contacts c ON b.client_id = c.id WHERE b.id = $1",
+        "SELECT b.*, c.name as client_name, c.phone as client_phone, c.email as client_email, c.address as client_address FROM budgets b LEFT JOIN contacts c ON b.contact_id = c.id WHERE b.id = $1",
         [req.params.id]
       );
       if (!rows[0]) return res.status(404).json({ error: 'Presupuesto no encontrado' });
@@ -212,7 +231,7 @@ module.exports = function(app, pool, authenticate) {
 
       const { rows: orderRows } = await client.query(
         "INSERT INTO orders (client_id, contact_id, order_number, subtotal, total, notes, order_status_id, payment_status_id, type) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'venta') RETURNING id",
-        [clientId, budget.client_id, orderNumber, budget.subtotal, budget.total, budget.notes || '', statusRows[0] && statusRows[0].id || 1, payRows[0] && payRows[0].id || 1]
+        [clientId, budget.contact_id, orderNumber, budget.subtotal, budget.total, budget.notes || '', statusRows[0] && statusRows[0].id || 1, payRows[0] && payRows[0].id || 1]
       );
       const orderId = orderRows[0].id;
 
@@ -241,7 +260,7 @@ module.exports = function(app, pool, authenticate) {
   app.get('/api/budgets/:id/pdf', authenticate, async (req, res) => {
     try {
       const { rows } = await pool.query(
-        "SELECT b.*, c.name as client_name, c.phone as client_phone, c.email as client_email, c.address as client_address FROM budgets b LEFT JOIN contacts c ON b.client_id = c.id WHERE b.id = $1",
+        "SELECT b.*, c.name as client_name, c.phone as client_phone, c.email as client_email, c.address as client_address FROM budgets b LEFT JOIN contacts c ON b.contact_id = c.id WHERE b.id = $1",
         [req.params.id]
       );
       if (!rows[0]) return res.status(404).json({ error: 'Presupuesto no encontrado' });

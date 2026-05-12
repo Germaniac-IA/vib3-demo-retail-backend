@@ -38,3 +38,5 @@ CREATE TABLE IF NOT EXISTS budget_designs (
   updated_at TIMESTAMP DEFAULT NOW(),
   UNIQUE(client_id)
 );
+
+ALTER TABLE budgets ADD COLUMN IF NOT EXISTS contact_id INT REFERENCES contacts(id) ON DELETE SET NULL;
