@@ -28,17 +28,6 @@ const pool = new Pool({
   connectionTimeoutMillis: 2000,
 });
 
-
-async function getNextOrderNumber(db, clientId) {
-  const { rows } = await db.query(
-    `SELECT COALESCE(MAX(CAST(SUBSTRING(order_number FROM 4) AS INTEGER)), 0) + 1 AS next_num
-     FROM orders
-     WHERE client_id = $1 AND order_number ~ '^NV-[0-9]+$'`,
-    [clientId]
-  );
-  return 'NV-' + String(Number(rows[0].next_num || 1)).padStart(5, '0');
-}
-
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }))
 app.use(function(err,req,res,next){if(err instanceof SyntaxError){console.error('JSON parse error');res.status(400).json({error:'Invalid JSON'});}next(err);});
@@ -1076,43 +1065,6 @@ app.post('/api/input-items/update-costs', authenticate, async (req, res) => {
 
 
 // ─── UPDATE PRICES ─────────────────────────────────────────────────
-// POST /api/services/update-prices — update service prices (single = newPrice, multi = % or $)
-app.post('/api/services/update-prices', authenticate, async (req, res) => {
-  try {
-    let { serviceIds = [], productIds = [], newPrice, increasePercent, increaseAmount } = req.body;
-    if (!Array.isArray(serviceIds) || serviceIds.length === 0) serviceIds = productIds;
-    const ids = (Array.isArray(serviceIds) ? serviceIds : []).map(Number).filter(Boolean);
-    if (!ids.length) return res.status(400).json({ error: 'Sin servicios seleccionados' });
-
-    if (newPrice !== undefined && newPrice !== null) {
-      const { rows } = await pool.query(
-        "UPDATE services SET price = $1, updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id",
-        [Number(newPrice) || 0, req.user.client_id, ids]
-      );
-      return res.json({ success: true, updated: rows.length });
-    }
-
-    if (increasePercent !== undefined && increasePercent !== null) {
-      const { rows } = await pool.query(
-        "UPDATE services SET price = ROUND(price * (1 + $1::numeric / 100)), updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id",
-        [Number(increasePercent) || 0, req.user.client_id, ids]
-      );
-      return res.json({ success: true, updated: rows.length });
-    }
-
-    if (increaseAmount !== undefined && increaseAmount !== null) {
-      const { rows } = await pool.query(
-        "UPDATE services SET price = price + $1, updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id",
-        [Number(increaseAmount) || 0, req.user.client_id, ids]
-      );
-      return res.json({ success: true, updated: rows.length });
-    }
-
-    return res.status(400).json({ error: 'Falta newPrice, increasePercent o increaseAmount' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-
 app.post('/api/products/update-prices', authenticate, async (req, res) => {
   try {
     const { productIds = [], newPrice, increasePercent, increaseAmount } = req.body;
@@ -1124,7 +1076,7 @@ app.post('/api/products/update-prices', authenticate, async (req, res) => {
         `UPDATE products SET price = $1, updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id`,
         [Number(newPrice) || 0, req.user.client_id, ids]
       );
-      return res.json({ success: true, updated: rows.length });
+      return res.json({ success: true, updated: result.rowCount });
     }
 
     if (increasePercent !== undefined && increasePercent !== null) {
@@ -1132,7 +1084,7 @@ app.post('/api/products/update-prices', authenticate, async (req, res) => {
         `UPDATE products SET price = ROUND(price * (1 + $1::numeric / 100)), updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id`,
         [Number(increasePercent) || 0, req.user.client_id, ids]
       );
-      return res.json({ success: true, updated: rows.length });
+      return res.json({ success: true, updated: result.rowCount });
     }
 
     if (increaseAmount !== undefined && increaseAmount !== null) {
@@ -1140,7 +1092,7 @@ app.post('/api/products/update-prices', authenticate, async (req, res) => {
         `UPDATE products SET price = price + $1, updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id`,
         [Number(increaseAmount) || 0, req.user.client_id, ids]
       );
-      return res.json({ success: true, updated: rows.length });
+      return res.json({ success: true, updated: result.rowCount });
     }
 
     return res.status(400).json({ error: 'Falta newPrice, increasePercent o increaseAmount' });
@@ -1222,9 +1174,7 @@ app.get('/api/contacts/:id/360', authenticate, async (req, res) => {
 
     // 2. Órdenes del contacto
     const orders = (await pool.query(
-      `SELECT o.*, os.name as status_name, ps.name as payment_status_name,
-              COALESCE((SELECT SUM(op.amount) FROM order_payments op WHERE op.order_id = o.id AND op.deleted_at IS NULL), 0) AS paid_amount,
-              GREATEST(o.total - COALESCE((SELECT SUM(op.amount) FROM order_payments op WHERE op.order_id = o.id AND op.deleted_at IS NULL), 0), 0) AS balance_due
+      `SELECT o.*, os.name as status_name, ps.name as payment_status_name
        FROM orders o
        LEFT JOIN order_statuses os ON o.order_status_id = os.id
        LEFT JOIN payment_statuses ps ON o.payment_status_id = ps.id
@@ -1311,38 +1261,23 @@ app.get('/api/contacts/:id/360', authenticate, async (req, res) => {
     }
 
     // 8. Estadísticas expandidas
-    // Important: do not join order_items into the order totals query, because it multiplies o.total by item count.
-    // Debt is calculated per NV as SUM(GREATEST(order.total - payments, 0)) so partial payments and overpayments don't distort it.
     const statsRow = (await pool.query(
-      `WITH order_balances AS (
-         SELECT
-           o.id,
-           o.total,
-           o.created_at,
-           COALESCE((SELECT SUM(op.amount) FROM order_payments op WHERE op.order_id = o.id AND op.deleted_at IS NULL), 0) AS paid
-         FROM orders o
-         WHERE o.contact_id = $1 AND o.client_id = $2 AND o.deleted_at IS NULL
-       ), product_stats AS (
-         SELECT COUNT(DISTINCT oi.product_id) AS unique_products_bought
-         FROM order_items oi
-         JOIN orders o ON oi.order_id = o.id
-         WHERE o.contact_id = $1 AND o.client_id = $2 AND o.deleted_at IS NULL AND oi.deleted_at IS NULL
-       )
-       SELECT
-         COUNT(ob.id) AS total_orders,
-         COALESCE(SUM(ob.total), 0) AS total_spent,
-         COALESCE(SUM(ob.paid), 0) AS total_paid,
-         COALESCE(SUM(GREATEST(ob.total - ob.paid, 0)), 0) AS balance,
-         COALESCE(AVG(ob.total), 0) AS avg_ticket,
-         MAX(ob.created_at) AS last_order_date,
-         COALESCE((SELECT unique_products_bought FROM product_stats), 0) AS unique_products_bought
-       FROM order_balances ob`,
+      `SELECT
+        COUNT(DISTINCT o.id) as total_orders,
+        COALESCE(SUM(o.total), 0) as total_spent,
+        COALESCE((SELECT SUM(op.amount) FROM order_payments op JOIN orders o2 ON op.order_id = o2.id WHERE o2.contact_id = $1 AND o2.client_id = $2 AND op.deleted_at IS NULL), 0) as total_paid,
+        COALESCE(AVG(o.total), 0) as avg_ticket,
+        MAX(o.created_at) as last_order_date,
+        COUNT(DISTINCT oi.product_id) as unique_products_bought
+       FROM orders o
+       LEFT JOIN order_items oi ON oi.order_id = o.id AND oi.deleted_at IS NULL
+       WHERE o.contact_id = $1 AND o.client_id = $2 AND o.deleted_at IS NULL`,
       [cid, clientId]
     )).rows[0];
 
     const totalSpent = parseFloat(statsRow.total_spent) || 0;
     const totalPaid = parseFloat(statsRow.total_paid) || 0;
-    const balance = parseFloat(statsRow.balance) || 0;
+    const balance = totalSpent - totalPaid;
 
     res.json({
       contact,
@@ -1982,7 +1917,11 @@ app.post('/api/orders', authenticate, async (req, res) => {
     } = req.body;
 
     const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const orderNum = await getNextOrderNumber(client, req.user.client_id);
+    const countResult = await client.query(
+      "SELECT COUNT(*) FROM orders WHERE deleted_at IS NULL AND client_id = $1",
+      [req.user.client_id]
+    );
+    const orderNum = 'NV-' + String(parseInt(countResult.rows[0].count) + 1).padStart(5, '0');
 
     const subtotal = (items || []).reduce((sum, item) => sum + (Number(item.quantity) * Number(item.unit_price || 0)), 0);
     const fee = Number(delivery_fee) || 0;
@@ -6346,14 +6285,14 @@ app.put('/api/services/:id', authenticate, async (req, res) => {
     if (rows.length === 0) return res.status(404).json({ error: 'Servicio no encontrado' });
     if (rows[0].is_recurring === true) {
       await pool.query(
-        `INSERT INTO plans (client_id, service_id, name, description, amount, billing_cycle, sort_order)
-         VALUES ($1, $2, $3, $4, $5, 'monthly', $6)
+        `INSERT INTO plans (client_id, service_id, name, description, amount, billing_cycle, sort_order, created_by)
+         VALUES ($1, $2, $3, $4, $5, 'monthly', $6, $7)
          ON CONFLICT DO NOTHING`,
-        [req.user.client_id, rows[0].id, rows[0].name, rows[0].description || '', rows[0].price || 0, rows[0].sort_order || 0]
+        [req.user.client_id, rows[0].id, rows[0].name, rows[0].description || '', rows[0].price || 0, rows[0].sort_order || 0, req.user.id]
       );
       await pool.query(
         `UPDATE plans SET deleted_at = NULL, name = $1, description = $2, amount = $3, is_active = true, updated_at = NOW()
-         WHERE client_id = $4 AND service_id = $5`,
+         WHERE client_id = $4 AND service_id = $5 AND deleted_at IS NOT NULL`,
         [rows[0].name, rows[0].description || '', rows[0].price || 0, req.user.client_id, rows[0].id]
       );
     }
@@ -6767,110 +6706,6 @@ app.get('/api/subscriptions/:id/billing-cycles', authenticate, async (req, res) 
   }
 });
 
-// GET /api/billing/overview — subscription/overview KPI summary
-app.get('/api/billing/overview', authenticate, async (req, res) => {
-  try {
-    const { rows: active_subscriptions } = await pool.query(
-      "SELECT COUNT(*)::int FROM subscriptions WHERE client_id = $1 AND deleted_at IS NULL AND status != 'cancelled'",
-      [req.user.client_id]
-    );
-    const { rows: overdue } = await pool.query(
-      "SELECT COUNT(*)::int AS overdue_cycles, COALESCE(SUM(amount), 0) AS overdue_total FROM billing_cycles bc WHERE bc.client_id = $1 AND bc.deleted_at IS NULL AND bc.due_date < CURRENT_DATE AND bc.order_id IS NULL",
-      [req.user.client_id]
-    );
-    const { rows: upcoming } = await pool.query(
-      "SELECT COUNT(*)::int AS upcoming_cycles, COALESCE(SUM(amount), 0) AS upcoming_total FROM billing_cycles bc WHERE bc.client_id = $1 AND bc.deleted_at IS NULL AND bc.due_date >= CURRENT_DATE AND bc.due_date <= CURRENT_DATE + 30 AND bc.order_id IS NULL",
-      [req.user.client_id]
-    );
-    const { rows: revenue } = await pool.query(
-      "SELECT COALESCE(SUM(amount), 0) AS monthly_revenue FROM billing_cycles bc WHERE bc.client_id = $1 AND bc.deleted_at IS NULL AND bc.due_date >= DATE_TRUNC('month', CURRENT_DATE) AND bc.due_date <= (DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month - 1 day')::date AND bc.order_id IS NULL",
-      [req.user.client_id]
-    );
-    res.json({
-      active_subscriptions: active_subscriptions[0].count,
-      overdue_cycles: overdue[0].overdue_cycles,
-      overdue_total: parseFloat(overdue[0].overdue_total),
-      upcoming_cycles: upcoming[0].upcoming_cycles,
-      upcoming_total: parseFloat(upcoming[0].upcoming_total),
-      monthly_revenue: parseFloat(revenue[0].monthly_revenue)
-    });
-  } catch (err) {
-    console.error('Error en billing overview:', err);
-    res.json({ active_subscriptions: 0, overdue_cycles: 0, overdue_total: 0, upcoming_cycles: 0, upcoming_total: 0, monthly_revenue: 0 });
-  }
-});
-
-// POST /api/subscriptions/batch-generate-cycles — generate ONE cycle per active sub (current/overdue only, no future)
-app.post('/api/subscriptions/batch-generate-cycles', authenticate, async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { rows: subs } = await client.query(
-      "SELECT s.id, s.plan_id, s.billing_amount, s.start_date, s.contact_id FROM subscriptions s WHERE s.client_id = $1 AND s.deleted_at IS NULL AND s.status != 'cancelled' ORDER BY s.id",
-      [req.user.client_id]
-    );
-    const cycleMap = { weekly: 7, biweekly: 14, monthly: 30, quarterly: 90, semiannual: 180, annual: 365 };
-
-    let generated = 0;
-    let skipped = 0;
-
-    for (const sub of subs) {
-      const { rows: planRows } = await client.query('SELECT billing_cycle, name FROM plans WHERE id = $1', [sub.plan_id]);
-      const days = cycleMap[planRows[0]?.billing_cycle] || 30;
-      const planName = planRows[0]?.name || '';
-
-      // Get the last period_end
-      const { rows: maxRow } = await client.query(
-        'SELECT MAX(period_end) AS last_end FROM billing_cycles WHERE subscription_id = $1 AND deleted_at IS NULL',
-        [sub.id]
-      );
-      const cursor = maxRow[0]?.last_end ? new Date(maxRow[0].last_end) : new Date(sub.start_date);
-
-      // Calculate the next period
-      const nextStart = new Date(cursor);
-      nextStart.setDate(nextStart.getDate() + 1);
-      const ns = nextStart.toISOString().split('T')[0];
-      const nextEnd = new Date(nextStart);
-      nextEnd.setDate(nextEnd.getDate() + days);
-      const ne = nextEnd.toISOString().split('T')[0];
-
-      // Skip if this cycle already exists
-      const { rows: dup } = await client.query(
-        'SELECT 1 FROM billing_cycles WHERE subscription_id = $1 AND period_start = $2 AND deleted_at IS NULL',
-        [sub.id, ns]
-      );
-      if (dup.length > 0) { skipped++; continue; }
-
-      // Skip if this is a future period (beyond today)
-      if (new Date(ns) > new Date()) { skipped++; continue; }
-
-      // Create the cycle
-      await client.query('BEGIN');
-      const { rows: newBC } = await client.query(
-        'INSERT INTO billing_cycles (client_id, subscription_id, period_start, period_end, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-        [req.user.client_id, sub.id, ns, ne, sub.billing_amount, new Date(nextEnd.getTime() + 86400000).toISOString().split('T')[0]]
-      );
-      await client.query(
-        'INSERT INTO invoice_items (client_id, billing_cycle_id, description, amount, type, quantity, unit_price) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-        [req.user.client_id, newBC[0].id, 'Cuota ' + planName, sub.billing_amount, 'subscription', 1, sub.billing_amount]
-      );
-      await client.query(
-        "UPDATE subscriptions SET next_billing_date = $1, updated_at = NOW() WHERE id = $2",
-        [new Date(nextEnd.getTime() + 86400000).toISOString().split('T')[0], sub.id]
-      );
-      await client.query('COMMIT');
-      generated++;
-    }
-
-    res.json({ generated, skipped });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Error batch generating cycles:', err);
-    res.status(500).json({ error: 'Error al generar ciclos' });
-  } finally {
-    client.release();
-  }
-});
-
 // POST /api/subscriptions/:id/generate-cycle — manually generate next billing cycle
 app.post('/api/subscriptions/:id/generate-cycle', authenticate, async (req, res) => {
   const client = await pool.connect();
@@ -6884,91 +6719,50 @@ app.post('/api/subscriptions/:id/generate-cycle', authenticate, async (req, res)
     if (subRows.length === 0) throw { status: 404, message: 'Suscripción no encontrada' };
     const sub = subRows[0];
 
-        // Get last billing cycle period_end, walking past any existing periods
-    const cycleMap = { weekly: 7, biweekly: 14, monthly: 30, quarterly: 90, semiannual: 180, annual: 365 };
-    const { rows: planRows } = await client.query('SELECT billing_cycle, name FROM plans WHERE id = $1', [sub.plan_id]);
-    const days = cycleMap[planRows[0]?.billing_cycle] || 30;
-    const planName = planRows[0]?.name || '';
-
-    // Determine cursor: MAX(period_end) or start_date if no cycles exist
-    const { rows: maxRow } = await client.query(
-      'SELECT MAX(period_end) AS last_end FROM billing_cycles WHERE subscription_id = $1 AND deleted_at IS NULL',
+    // Get last billing cycle to calculate next period
+    const { rows: bcRows } = await client.query(
+      'SELECT * FROM billing_cycles WHERE subscription_id = $1 AND deleted_at IS NULL ORDER BY period_end DESC LIMIT 1',
       [sub.id]
     );
-    let cursor = maxRow[0]?.last_end ? new Date(maxRow[0].last_end) : new Date(sub.start_date);
+    const lastEnd = bcRows.length > 0 ? new Date(bcRows[0].period_end) : new Date(sub.start_date);
 
-    // Calculate the upcoming period
-    const nextPeriodStart = new Date(cursor);
-    nextPeriodStart.setDate(nextPeriodStart.getDate() + 1);
-    const nextPs = nextPeriodStart.toISOString().split('T')[0];
-    const nextPeriodEnd = new Date(nextPeriodStart);
-    nextPeriodEnd.setDate(nextPeriodEnd.getDate() + days);
-    const nextPe = nextPeriodEnd.toISOString().split('T')[0];
-
-    // Check if the immediate next period already exists
-    const { rows: existing } = await client.query(
-      'SELECT 1 FROM billing_cycles WHERE subscription_id = $1 AND period_start = $2 AND deleted_at IS NULL',
-      [sub.id, nextPs]
-    );
-    if (existing.length > 0) {
-      // User must confirm they want to skip forward
-      const { skip } = req.body;
-      if (!skip) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({
-          error: 'already_exists',
-          message: 'El ciclo ' + nextPs + ' a ' + nextPe + ' ya existe.',
-          next_period_start: nextPs,
-          next_period_end: nextPe
-        });
-      }
-      // Walk forward past all existing cycles to find a gap
-      let tempDate = nextPeriodEnd;
-      for (let i = 0; i < 12; i++) {
-        const testStart = new Date(tempDate);
-        testStart.setDate(testStart.getDate() + 1);
-        const ts = testStart.toISOString().split('T')[0];
-        const { rows: dup } = await client.query(
-          'SELECT 1 FROM billing_cycles WHERE subscription_id = $1 AND period_start = $2 AND deleted_at IS NULL',
-          [sub.id, ts]
-        );
-        if (dup.length === 0) {
-          cursor = tempDate;
-          break;
-        }
-        tempDate.setDate(tempDate.getDate() + days);
-        if (i === 11) {
-          await client.query('ROLLBACK');
-          return res.status(400).json({ error: 'Ya existen 12+ periodos hacia adelante.' });
-        }
-      }
-    }
-
-    // Found a gap — create the cycle
-    const periodStart = new Date(cursor);
+    const periodStart = new Date(lastEnd);
     periodStart.setDate(periodStart.getDate() + 1);
-    const ps = periodStart.toISOString().split('T')[0];
+
+    // Get plan info for cycle calculation
+    const { rows: planRows } = await client.query(
+      'SELECT billing_cycle FROM plans WHERE id = $1',
+      [sub.plan_id]
+    );
+    const cycleMap = { weekly: 7, biweekly: 14, monthly: 30, quarterly: 90, semiannual: 180, annual: 365 };
+    const days = cycleMap[planRows[0]?.billing_cycle] || 30;
+
     const periodEnd = new Date(periodStart);
     periodEnd.setDate(periodEnd.getDate() + days);
 
+    // Update subscription next_billing_date
+    const nextBilling = new Date(periodEnd);
+    nextBilling.setDate(nextBilling.getDate() + 1);
+
     const { rows: newBC } = await client.query(
       'INSERT INTO billing_cycles (client_id, subscription_id, period_start, period_end, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-      [req.user.client_id, sub.id, ps, periodEnd.toISOString().split('T')[0], sub.billing_amount, new Date(periodEnd.getTime() + 86400000).toISOString().split('T')[0]]
+      [req.user.client_id, sub.id, periodStart.toISOString().split('T')[0], periodEnd.toISOString().split('T')[0], sub.billing_amount, nextBilling.toISOString().split('T')[0]]
     );
 
+    // Create invoice item
+    const { rows: planName } = await client.query('SELECT name FROM plans WHERE id = $1', [sub.plan_id]);
     await client.query(
       'INSERT INTO invoice_items (client_id, billing_cycle_id, description, amount, type, quantity, unit_price) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-      [req.user.client_id, newBC[0].id, 'Cuota ' + planName, sub.billing_amount, 'subscription', 1, sub.billing_amount]
+      [req.user.client_id, newBC[0].id, 'Cuota ' + (planName[0]?.name || ''), sub.billing_amount, 'subscription', 1, sub.billing_amount]
     );
 
     await client.query(
       'UPDATE subscriptions SET next_billing_date = $1, updated_at = NOW() WHERE id = $2',
-      [new Date(periodEnd.getTime() + 86400000).toISOString().split('T')[0], sub.id]
+      [nextBilling.toISOString().split('T')[0], sub.id]
     );
 
     await client.query('COMMIT');
-    return res.status(201).json(newBC[0]);
-
+    res.status(201).json(newBC[0]);
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Error generating cycle:', err);
@@ -7063,7 +6857,11 @@ async function devengarBCs(req, res, subscription_id, contact_id) {
       );
       const order = orderRows[0];
 
-      const orderNumber = await getNextOrderNumber(client, req.user.client_id);
+      const countResult = await client.query(
+        "SELECT COUNT(*) FROM orders WHERE deleted_at IS NULL AND client_id = $1",
+        [req.user.client_id]
+      );
+      const orderNumber = 'NV-' + String(parseInt(countResult.rows[0].count) + 1).padStart(5, '0');
       await client.query('UPDATE orders SET order_number = $1 WHERE id = $2', [orderNumber, order.id]);
 
       let serviceId = bc.service_id || null;
@@ -7149,7 +6947,11 @@ async function devengarSingleBC(req, res, cycleId) {
     );
     const order = orderRows[0];
 
-    const orderNumber = await getNextOrderNumber(client, req.user.client_id);
+    const countResult = await client.query(
+      "SELECT COUNT(*) FROM orders WHERE deleted_at IS NULL AND client_id = $1",
+      [req.user.client_id]
+    );
+    const orderNumber = 'NV-' + String(parseInt(countResult.rows[0].count) + 1).padStart(5, '0');
     await client.query('UPDATE orders SET order_number = $1 WHERE id = $2', [orderNumber, order.id]);
 
     let serviceId = bc.service_id || null;

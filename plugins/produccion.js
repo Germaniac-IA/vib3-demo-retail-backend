@@ -92,7 +92,103 @@ module.exports = function(app, pool, authenticate) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
-  app.patch('/api/plugins/produccion/advance/:itemId', authenticate, checkPlugin, async (req, res) => {
+  // ─── Stage CRUD (admin configuration) ────────────────────────────────────
+app.post('/api/plugins/produccion/stages', authenticate, checkPlugin, async (req, res) => {
+  const { name } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Nombre requerido' });
+  try {
+    // Get max sort_order
+    const max = await pool.query('SELECT COALESCE(MAX(sort_order), 0) + 1 as next_sort FROM production_stages WHERE client_id = $1', [req.user.client_id]);
+    const result = await pool.query(
+      'INSERT INTO production_stages (client_id, name, sort_order) VALUES ($1, $2, $3) RETURNING *',
+      [req.user.client_id, name.trim(), max.rows[0].next_sort]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/plugins/produccion/stages/:id', authenticate, checkPlugin, async (req, res) => {
+  const { name } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Nombre requerido' });
+  try {
+    const result = await pool.query(
+      'UPDATE production_stages SET name = $1, updated_at = NOW() WHERE id = $2 AND client_id = $3 RETURNING *',
+      [name.trim(), req.params.id, req.user.client_id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Stage no encontrado' });
+    res.json(result.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/plugins/produccion/stages/:id', authenticate, checkPlugin, async (req, res) => {
+  try {
+    // Check if any production items reference this stage
+    const refs = await pool.query(
+      'SELECT COUNT(*) as count FROM production_order_items WHERE current_stage_id = $1 AND deleted_at IS NULL',
+      [req.params.id]
+    );
+    if (parseInt(refs.rows[0].count) > 0) {
+      return res.status(400).json({ error: 'No se puede eliminar: hay items produccion en esta etapa' });
+    }
+    const result = await pool.query(
+      'DELETE FROM production_stages WHERE id = $1 AND client_id = $2',
+      [req.params.id, req.user.client_id]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: 'Stage no encontrado' });
+    // Re-index sort_order for remaining stages
+    const remaining = await pool.query(
+      'SELECT id FROM production_stages WHERE client_id = $1 ORDER BY sort_order',
+      [req.user.client_id]
+    );
+    for (let i = 0; i < remaining.rows.length; i++) {
+      await pool.query('UPDATE production_stages SET sort_order = $1 WHERE id = $2', [i + 1, remaining.rows[i].id]);
+    }
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/plugins/produccion/stages/:id/sort', authenticate, checkPlugin, async (req, res) => {
+  try {
+    const stage = await pool.query('SELECT id FROM production_stages WHERE id = $1 AND client_id = $2', [req.params.id, req.user.client_id]);
+    if (!stage.rows.length) return res.status(404).json({ error: 'Stage no encontrado' });
+
+    const { sort_order } = req.body;
+    if (typeof sort_order !== 'number' || sort_order < 1) return res.status(400).json({ error: 'sort_order invalido' });
+
+    // Shift other stages
+    const all = await pool.query(
+      'SELECT id, sort_order FROM production_stages WHERE client_id = $1 AND id != $2 ORDER BY sort_order',
+      [req.user.client_id, req.params.id]
+    );
+
+    // We'll assign sequentially: insert target at desired position, shift rest
+    const stages = [{ id: parseInt(req.params.id), sort_order }];
+    let pos = 1;
+    for (const s of all.rows) {
+      if (pos === sort_order) pos++; // skip the target position
+      stages.push({ id: s.id, sort_order: pos });
+      pos++;
+    }
+
+    // Re-sort using temporary negative values to avoid unique constraint clashes
+    // First set all to negative, then set final
+    for (const s of stages) {
+      await pool.query('UPDATE production_stages SET sort_order = $1 WHERE id = $2', [-s.sort_order, s.id]);
+    }
+    for (const s of stages) {
+      await pool.query('UPDATE production_stages SET sort_order = $1 WHERE id = $2', [s.sort_order, s.id]);
+    }
+
+    const updated = await pool.query(
+      'SELECT * FROM production_stages WHERE client_id = $1 ORDER BY sort_order',
+      [req.user.client_id]
+    );
+    res.json(updated.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+app.patch('/api/plugins/produccion/advance/:itemId', authenticate, checkPlugin, async (req, res) => {
     const cid = req.user.client_id;
     try {
       const item = await pool.query(
