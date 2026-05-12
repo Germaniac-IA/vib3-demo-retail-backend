@@ -232,15 +232,15 @@ module.exports = function(app, pool, authenticate) {
       const { rows: payRows } = await client.query("SELECT id FROM payment_statuses WHERE name = 'Impago' LIMIT 1");
 
       const { rows: orderRows } = await client.query(
-        "INSERT INTO orders (client_id, contact_id, order_number, subtotal, total, notes, order_status_id, payment_status_id, type) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'venta') RETURNING id",
-        [clientId, budget.contact_id, orderNumber, budget.subtotal, budget.total, budget.notes || '', statusRows[0] && statusRows[0].id || 1, payRows[0] && payRows[0].id || 1]
+        "INSERT INTO orders (client_id, contact_id, order_number, subtotal, total, notes, order_status_id, payment_status_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8 ) RETURNING id",
+        [clientId, budget.contact_id, orderNumber, Number(budget.subtotal || 0), Number(budget.total || 0), budget.notes || '', statusRows[0] && statusRows[0].id || 1, payRows[0] && payRows[0].id || 1]
       );
       const orderId = orderRows[0].id;
 
       for (const item of budgetItems) {
         await client.query(
           "INSERT INTO order_items (order_id, product_id, service_id, product_name, quantity, unit_price, subtotal) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-          [orderId, item.product_id, item.service_id, item.description, item.quantity, item.unit_price, item.subtotal]
+          [orderId, item.product_id || null, item.service_id || null, item.description || "", Number(item.quantity) || 1, Number(item.unit_price) || 0, Number(item.subtotal) || 0]
         );
       }
 
