@@ -7409,6 +7409,28 @@ try {
 } catch (e) {
   if (e.code !== "MODULE_NOT_FOUND") console.error('Error cargando plugin:', e.message);
 }
+try {
+  require('./plugins/budgets')(app, pool, authenticate);
+  console.log('Plugin budgets cargado');
+} catch (e) {
+  if (e.code !== "MODULE_NOT_FOUND") console.error('Error cargando budgets:', e.message);
+}
+
+// Auto-expire budgets on startup and every hour
+setTimeout(async () => {
+  try {
+    await pool.query("UPDATE budgets SET status = 'vencido', updated_at = NOW() WHERE status = 'pendiente' AND valid_until IS NOT NULL AND valid_until < CURRENT_DATE");
+    console.log('Budgets auto-expire check done');
+  } catch (e) { console.warn('auto-expire budgets on startup skipped:', e.message); }
+}, 5000);
+
+setInterval(async () => {
+  try {
+    await pool.query("UPDATE budgets SET status = 'vencido', updated_at = NOW() WHERE status = 'pendiente' AND valid_until IS NOT NULL AND valid_until < CURRENT_DATE");
+  } catch (e) { console.warn('auto-expire budgets:', e.message); }
+}, 3600000);
+
+
 
 app.listen(PORT, () => {
   console.log(`🚀 VIB3.ia Backend running on http://localhost:${PORT}`);
