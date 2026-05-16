@@ -14,6 +14,7 @@ const SIM_TTL_MS = 4 * 60 * 60 * 1000; // 4 horas
 
 module.exports = function(app, pool, authenticate) {
   const simulations = {};
+  ensureArchitectDrafts(pool).catch(err => console.error('[architect] Error creando architect_drafts:', err));
 
   // ─── START ──────────────────────────────────────────────
   app.post('/api/simulator/start', authenticate, async (req, res) => {
@@ -113,41 +114,102 @@ module.exports = function(app, pool, authenticate) {
     }
   });
 
-    // ─── ARCHITECT CHAT ─────────────────────────────────────
-  app.post('/api/architect/chat', authenticate, async (req, res) => {
+    // ─── ARCHITECT: ANALYZE → DRAFT → APPLY ──────────────────
+  app.post('/api/architect/analyze', authenticate, async (req, res) => {
     try {
       const { message } = req.body;
       if (!message) return res.status(400).json({ error: 'message es requerido' });
 
-      // Enviar al agente REAL (no simulación)
-      const response = await callChatCompletions(GW_PORT, GW_TOKEN, GW_REAL_MODEL, [
-        { role: 'system', content: 'INSTRUCCIÓN IMPORTANTE: Estás en MODO ARQUITECTO. El usuario te va a enseñar cosas sobre su negocio que debeS recordar. EJECUTÁ SIEMPRE save_knowledge cuando el usuario te diga algo como "quiero que sepas", "recordá", "importante", "tené en cuenta", "Pérez es...", o cualquier instrucción sobre cómo manejar clientes, productos, pagos o stock. Usá category="correction" y el contenido exacto. No digas solo "entendido" sin guardar.' },
-        { role: 'user', content: message }
-      ]);
+      const agentId = await getDefaultAgentId(pool, req.user.client_id);
+      const classification = await classifyArchitectMessage(message);
+      const type = classification.type || 'ambiguous';
+      const targetTable = targetTableForType(type);
+      const payload = normalizeArchitectPayload(classification, message);
 
-      // Fallback: guardar automáticamente si el mensaje parece una enseñanza
-      const enseñanzas = ['quiero que sepas', 'recorda', 'importante', 'tenelo en cuenta',
-        'no le bloquees', 'es confiable', 'caso especial', 'excepción',
-        'especial', 'cuidado con', 'atención con'];
-      const esEnseñanza = enseñanzas.some(p => message.toLowerCase().includes(p));
+      const draftResult = await pool.query(
+        `INSERT INTO architect_drafts
+          (client_id, agent_id, original_message, type, action, target_table, payload, confidence, reason, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending')
+         RETURNING *`,
+        [req.user.client_id, agentId, message, type, classification.action || 'create', targetTable, payload, Number(classification.confidence || 0.5), classification.reason || 'Clasificación propuesta por LLM']
+      );
 
-      if (esEnseñanza) {
-        await pool.query(
-          'INSERT INTO agent_knowledge (client_id, category, content, confidence, source) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING',
-          [req.user.client_id, 'correction', message, 0.8, 'manual']
-        );
-        console.log('[architect] Enseñanza guardada automáticamente');
+      res.json({ ok: true, draft: draftResult.rows[0] });
+    } catch (err) {
+      console.error('[architect] Error analyze:', err);
+      res.status(500).json({ error: 'Error al analizar enseñanza: ' + err.message });
+    }
+  });
+
+  // Backcompat: el chat del arquitecto ahora solo genera borrador, no escribe directo en knowledge.
+  app.post('/api/architect/chat', authenticate, async (req, res) => {
+    try {
+      const { message } = req.body;
+      if (!message) return res.status(400).json({ error: 'message es requerido' });
+      const agentId = await getDefaultAgentId(pool, req.user.client_id);
+      const classification = await classifyArchitectMessage(message);
+      const type = classification.type || 'ambiguous';
+      const draftResult = await pool.query(
+        `INSERT INTO architect_drafts
+          (client_id, agent_id, original_message, type, action, target_table, payload, confidence, reason, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending')
+         RETURNING *`,
+        [req.user.client_id, agentId, message, type, classification.action || 'create', targetTableForType(type), normalizeArchitectPayload(classification, message), Number(classification.confidence || 0.5), classification.reason || 'Clasificación propuesta por LLM']
+      );
+      res.json({ ok: true, reply: 'Generé una propuesta. Revisala y confirmá antes de guardar.', draft: draftResult.rows[0], knowledge_saved: false });
+    } catch (err) {
+      console.error('[architect] Error chat:', err);
+      res.status(500).json({ error: 'Error al analizar enseñanza: ' + err.message });
+    }
+  });
+
+  app.post('/api/architect/drafts/:id/apply', authenticate, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const draftRes = await client.query(
+        `SELECT * FROM architect_drafts WHERE id=$1 AND client_id=$2 FOR UPDATE`,
+        [req.params.id, req.user.client_id]
+      );
+      const draft = draftRes.rows[0];
+      if (!draft) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Borrador no encontrado' });
+      }
+      if (draft.status !== 'pending') {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'El borrador ya fue procesado' });
+      }
+      if (draft.type === 'ambiguous') {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Borrador ambiguo: editá o reclasificá antes de guardar' });
       }
 
-      res.json({
-        ok: true,
-        reply: response.choices[0].message.content,
-        usage: response.usage,
-        knowledge_saved: esEnseñanza
-      });
+      const applied = await applyArchitectDraft(client, draft);
+      await client.query(
+        `UPDATE architect_drafts SET status='applied', applied_ref=$1, updated_at=NOW() WHERE id=$2`,
+        [applied, draft.id]
+      );
+      await client.query('COMMIT');
+      res.json({ ok: true, applied });
     } catch (err) {
-      console.error('[architect] Error:', err);
-      res.status(500).json({ error: 'Error al procesar mensaje: ' + err.message });
+      await client.query('ROLLBACK');
+      console.error('[architect] Error apply:', err);
+      res.status(500).json({ error: 'Error al aplicar borrador: ' + err.message });
+    } finally {
+      client.release();
+    }
+  });
+
+  app.post('/api/architect/drafts/:id/discard', authenticate, async (req, res) => {
+    try {
+      const r = await pool.query(
+        `UPDATE architect_drafts SET status='discarded', updated_at=NOW() WHERE id=$1 AND client_id=$2 AND status='pending' RETURNING *`,
+        [req.params.id, req.user.client_id]
+      );
+      res.json({ ok: true, draft: r.rows[0] || null });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
     }
   });
 
@@ -167,6 +229,167 @@ module.exports = function(app, pool, authenticate) {
 };
 
 // ─── Helpers ──────────────────────────────────────────────
+
+async function ensureArchitectDrafts(pool) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS architect_drafts (
+      id SERIAL PRIMARY KEY,
+      client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+      agent_id INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+      original_message TEXT NOT NULL,
+      type VARCHAR(40) NOT NULL,
+      action VARCHAR(20) NOT NULL DEFAULT 'create',
+      target_table VARCHAR(60),
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      confidence DOUBLE PRECISION DEFAULT 0.5,
+      reason TEXT,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      applied_ref JSONB,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_architect_drafts_client_status ON architect_drafts(client_id, status)`);
+}
+
+async function getDefaultAgentId(pool, clientId) {
+  const r = await pool.query('SELECT id FROM agents WHERE deleted_at IS NULL AND client_id=$1 ORDER BY id LIMIT 1', [clientId]);
+  return r.rows[0]?.id || 1;
+}
+
+function targetTableForType(type) {
+  if (type === 'knowledge') return 'agent_knowledge';
+  if (type === 'permanent_instruction' || type === 'transient_instruction') return 'agent_instructions';
+  if (type === 'procedure') return 'agent_procedures';
+  return null;
+}
+
+function normalizeArchitectPayload(classification, originalMessage) {
+  const p = classification.payload || {};
+  const content = p.content || classification.summary || originalMessage;
+  if (classification.type === 'knowledge') {
+    return {
+      category: p.category || 'manual_instruction',
+      content,
+      confidence: Number(p.confidence || classification.confidence || 0.8),
+      source: 'manual'
+    };
+  }
+  if (classification.type === 'permanent_instruction') {
+    return { type: 'permanent', content, sort_order: Number(p.sort_order || 0) };
+  }
+  if (classification.type === 'transient_instruction') {
+    return { type: 'transient', content, sort_order: Number(p.sort_order || 0), expires_hint: p.expires_hint || null };
+  }
+  if (classification.type === 'procedure') {
+    return {
+      context: p.context || 'general',
+      step_order: Number(p.step_order || 0),
+      step_name: p.step_name || classification.summary || 'Nuevo paso',
+      step_prompt: p.step_prompt || content,
+      active: true
+    };
+  }
+  return { content, note: 'ambiguous' };
+}
+
+async function classifyArchitectMessage(message) {
+  const system = `Sos un clasificador del modo Arquitecto de un agente comercial/retail.
+Clasificá la enseñanza del usuario en EXACTAMENTE uno de estos types:
+- knowledge: dato contextual, excepción, preferencia, patrón o hecho del negocio. Informa decisiones, no ordena conducta global.
+- permanent_instruction: regla estable de conducta que el agente debe obedecer siempre o por defecto.
+- transient_instruction: instrucción temporal, campaña, promo o regla con vigencia limitada.
+- procedure: secuencia de pasos, workflow o proceso operativo.
+- ambiguous: no queda claro si debe guardarse o dónde.
+
+Devolvé SOLO JSON válido, sin markdown, con esta forma:
+{
+  "type": "knowledge|permanent_instruction|transient_instruction|procedure|ambiguous",
+  "confidence": 0.0,
+  "reason": "breve explicación",
+  "summary": "versión limpia para guardar",
+  "action": "create",
+  "payload": { }
+}
+
+Payload esperado:
+- knowledge: {"category":"payment_behavior|client_preference|business_rule|schedule_pattern|stock_threshold|cross_sell|manual_instruction", "content":"..."}
+- permanent_instruction/transient_instruction: {"content":"...", "expires_hint":"solo si temporal"}
+- procedure: {"context":"lead_nuevo|lead_caliente|cliente|admin|general", "step_name":"...", "step_prompt":"...", "step_order":0}
+Si hay mezcla de tipos, elegí el dominante y explicalo en reason.`;
+
+  const response = await callChatCompletions(GW_PORT, GW_TOKEN, GW_REAL_MODEL, [
+    { role: 'system', content: system },
+    { role: 'user', content: message }
+  ]);
+  const raw = response?.choices?.[0]?.message?.content || '';
+  return parseModelJson(raw);
+}
+
+function parseModelJson(raw) {
+  const original = String(raw || '').trim();
+  const candidates = [];
+
+  // Preferir bloques ```json ... ```; si el agente habló de más, el último bloque suele ser la clasificación final.
+  const fenceRe = /```(?:json)?\s*([\s\S]*?)```/gi;
+  let match;
+  while ((match = fenceRe.exec(original))) {
+    candidates.push(match[1].trim());
+  }
+
+  // Fallback: desde el último objeto con "type" hasta la última llave.
+  const typeIdx = original.lastIndexOf('"type"');
+  if (typeIdx >= 0) {
+    const first = original.lastIndexOf('{', typeIdx);
+    const last = original.lastIndexOf('}');
+    if (first >= 0 && last > first) candidates.push(original.slice(first, last + 1));
+  }
+
+  // Último fallback: objeto completo más amplio.
+  const first = original.indexOf('{');
+  const last = original.lastIndexOf('}');
+  if (first >= 0 && last > first) candidates.push(original.slice(first, last + 1));
+
+  for (const text of candidates.reverse()) {
+    try {
+      const parsed = JSON.parse(text);
+      const allowed = ['knowledge','permanent_instruction','transient_instruction','procedure','ambiguous'];
+      if (!allowed.includes(parsed.type)) parsed.type = 'ambiguous';
+      return parsed;
+    } catch (_) {}
+  }
+
+  return { type: 'ambiguous', confidence: 0.1, reason: 'No pude parsear JSON del clasificador', summary: original, payload: { content: original } };
+}
+
+async function applyArchitectDraft(client, draft) {
+  const p = draft.payload || {};
+  if (draft.type === 'knowledge') {
+    const r = await client.query(
+      `INSERT INTO agent_knowledge (client_id, category, content, confidence, source)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [draft.client_id, p.category || 'manual_instruction', p.content, Number(p.confidence || draft.confidence || 0.8), p.source || 'manual']
+    );
+    return { table: 'agent_knowledge', id: r.rows[0].id };
+  }
+  if (draft.type === 'permanent_instruction' || draft.type === 'transient_instruction') {
+    const r = await client.query(
+      `INSERT INTO agent_instructions (agent_id, type, content, sort_order)
+       VALUES ($1,$2,$3,$4) RETURNING *`,
+      [draft.agent_id || 1, p.type || (draft.type === 'permanent_instruction' ? 'permanent' : 'transient'), p.content, Number(p.sort_order || 0)]
+    );
+    return { table: 'agent_instructions', id: r.rows[0].id };
+  }
+  if (draft.type === 'procedure') {
+    const r = await client.query(
+      `INSERT INTO agent_procedures (agent_id, context, step_order, step_name, step_prompt, active)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [draft.agent_id || 1, p.context || 'general', Number(p.step_order || 0), p.step_name || 'Nuevo paso', p.step_prompt || p.content, p.active !== false]
+    );
+    return { table: 'agent_procedures', id: r.rows[0].id };
+  }
+  throw new Error('Tipo de borrador no aplicable: ' + draft.type);
+}
 
 async function cleanupSimulation(pool, simulations, clientId, reason) {
   const sim = simulations[clientId];
