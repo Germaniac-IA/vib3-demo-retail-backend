@@ -125,11 +125,13 @@ module.exports = function(app, pool, authenticate) {
   app.post('/api/simulator/:clientId/stop', authenticate, async (req, res) => {
     try {
       const sim = simulations[parseInt(req.params.clientId)];
-      if (!sim) {
-        return res.status(404).json({ error: 'No hay simulación activa' });
+      if (sim) {
+        await cleanupSimulation(pool, simulations, req.user.client_id, 'manual-stop');
+      } else {
+        // Idempotente: si el backend principal se reinició, pudo perder el estado
+        // en memoria aunque sigan vivos demo_sim y/o el backend 4002.
+        await cleanupOrphanSimulation(pool, 'manual-stop-orphan');
       }
-
-      await cleanupSimulation(pool, simulations, req.user.client_id, 'manual-stop');
 
       res.json({ ok: true, message: 'Simulación finalizada. BD clonada eliminada.' });
     } catch (err) {
@@ -240,7 +242,10 @@ module.exports = function(app, pool, authenticate) {
   // ─── STATUS ─────────────────────────────────────────────
   app.get('/api/simulator/:clientId/status', authenticate, async (req, res) => {
     const sim = simulations[parseInt(req.params.clientId)];
-    if (!sim) return res.json({ active: false });
+    if (!sim) {
+      const db = await pool.query('SELECT 1 FROM pg_database WHERE datname = $1', [SIM_DB]);
+      return res.json({ active: db.rowCount > 0, orphan: db.rowCount > 0, backend_port: db.rowCount > 0 ? SIM_PORT : undefined });
+    }
     res.json({
       active: true,
       started_at: sim.started_at,
@@ -431,10 +436,29 @@ async function cleanupSimulation(pool, simulations, clientId, reason) {
     }, 3000);
   }
 
-  await pool.query(`DROP DATABASE IF EXISTS ${SIM_DB}`);
+  await dropSimDatabase(pool);
   delete simulations[clientId];
   console.log(`[simulator] Cleanup completo (${reason}) para client ${clientId}`);
   return true;
+}
+
+async function cleanupOrphanSimulation(pool, reason) {
+  await killPort(SIM_PORT);
+  await dropSimDatabase(pool);
+  console.log(`[simulator] Cleanup orphan completo (${reason})`);
+}
+
+async function dropSimDatabase(pool) {
+  await pool.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, [SIM_DB]);
+  await pool.query(`DROP DATABASE IF EXISTS ${SIM_DB}`);
+}
+
+function killPort(port) {
+  return new Promise((resolve) => {
+    const child = spawn('sh', ['-lc', `fuser -k ${port}/tcp >/dev/null 2>&1 || true`], { stdio: 'ignore' });
+    child.on('close', () => resolve());
+    child.on('error', () => resolve());
+  });
 }
 
 function waitForServer(port, timeoutMs) {
