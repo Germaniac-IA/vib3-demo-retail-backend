@@ -7415,6 +7415,13 @@ try {
 } catch (e) {
   if (e.code !== "MODULE_NOT_FOUND") console.error('Error cargando budgets:', e.message);
 }
+try {
+  require("./simulator")(app, pool, authenticate);
+  console.log("Modulo simulador cargado");
+} catch (e) {
+  if (e.code !== "MODULE_NOT_FOUND") console.error("Error cargando simulador:", e.message);
+}
+
 
 // Auto-expire budgets on startup and every hour
 setTimeout(async () => {
