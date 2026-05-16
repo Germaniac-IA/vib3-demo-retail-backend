@@ -7430,6 +7430,63 @@ setInterval(async () => {
   } catch (e) { console.warn('auto-expire budgets:', e.message); }
 }, 3600000);
 
+// AGENT KNOWLEDGE
+app.get('/api/agent/knowledge', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, category, content, confidence, source, created_at, updated_at FROM agent_knowledge WHERE client_id = $1 AND is_active = true ORDER BY category, confidence DESC',
+      [req.user.client_id]
+    );
+    res.json({ knowledge: rows });
+  } catch (err) {
+    console.error('Error GET agent_knowledge:', err);
+    res.status(500).json({ error: 'Error al obtener conocimiento del agente' });
+  }
+});
+
+app.post('/api/agent/knowledge', authenticate, async (req, res) => {
+  try {
+    const { action, category, content, confidence, source } = req.body;
+    if (!action || !category || !content) {
+      return res.status(400).json({ error: 'action, category y content son requeridos' });
+    }
+    if (action === 'add') {
+      const { rows } = await pool.query(
+        'INSERT INTO agent_knowledge (client_id, category, content, confidence, source) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+        [req.user.client_id, category, content, confidence || 0.5, source || 'inferred']
+      );
+      return res.json({ knowledge: rows[0] });
+    }
+    if (action === 'update') {
+      const { rows } = await pool.query(
+        'UPDATE agent_knowledge SET content = $1, confidence = $2, source = $3, updated_at = NOW() WHERE client_id = $4 AND category = $5 AND is_active = true RETURNING *',
+        [content, confidence || 0.5, source || 'correction', req.user.client_id, category]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'No se encontro conocimiento activo para esa categoria' });
+      return res.json({ knowledge: rows[0] });
+    }
+    if (action === 'verify') {
+      const { rows } = await pool.query(
+        'UPDATE agent_knowledge SET confidence = LEAST(confidence + 0.1, 1.0), updated_at = NOW() WHERE client_id = $1 AND category = $2 AND content = $3 AND is_active = true RETURNING *',
+        [req.user.client_id, category, content]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'No se encontro el conocimiento especificado' });
+      return res.json({ knowledge: rows[0] });
+    }
+    if (action === 'deactivate') {
+      const { rows } = await pool.query(
+        'UPDATE agent_knowledge SET is_active = false, updated_at = NOW() WHERE client_id = $1 AND category = $2 AND content = $3 AND is_active = true RETURNING *',
+        [req.user.client_id, category, content]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'No se encontro el conocimiento especificado' });
+      return res.json({ knowledge: rows[0] });
+    }
+    return res.status(400).json({ error: 'Accion no valida. Usar: add, update, verify, deactivate' });
+  } catch (err) {
+    console.error('Error POST agent_knowledge:', err);
+    res.status(500).json({ error: 'Error al guardar conocimiento del agente' });
+  }
+});
 
 
 app.listen(PORT, () => {
