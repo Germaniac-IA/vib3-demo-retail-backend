@@ -10,6 +10,7 @@ const GW_TOKEN = 'demo-gateway-token-2026';
 const GW_MODEL = 'openclaw/demo-agent-sim';
 const GW_REAL_MODEL = 'openclaw/demo-agent';
 const DB_URL = 'postgresql://demo_user:V1b3_D3m0_2026@localhost:5432';
+const SIM_TTL_MS = 4 * 60 * 60 * 1000; // 4 horas
 
 module.exports = function(app, pool, authenticate) {
   const simulations = {};
@@ -43,7 +44,12 @@ module.exports = function(app, pool, authenticate) {
       // Esperar a que el backend esté listo
       await waitForServer(SIM_PORT, 15000);
 
-      const sim = { child, client_id: req.user.client_id, started_at: new Date() };
+      const sim = { child, client_id: req.user.client_id, started_at: new Date(), expires_at: new Date(Date.now() + SIM_TTL_MS), cleanup_timer: null };
+      sim.cleanup_timer = setTimeout(() => {
+        cleanupSimulation(pool, simulations, req.user.client_id, 'ttl-expired').catch(err => {
+          console.error('[simulator] Error en cleanup TTL:', err);
+        });
+      }, SIM_TTL_MS);
       simulations[req.user.client_id] = sim;
 
       res.json({
@@ -51,7 +57,9 @@ module.exports = function(app, pool, authenticate) {
         session_id: req.user.client_id,
         backend_port: SIM_PORT,
         model: GW_MODEL,
-        gateway_port: GW_PORT
+        gateway_port: GW_PORT,
+        expires_at: sim.expires_at,
+        ttl_hours: 4
       });
     } catch (err) {
       console.error('[simulator] Error en start:', err);
@@ -96,14 +104,7 @@ module.exports = function(app, pool, authenticate) {
         return res.status(404).json({ error: 'No hay simulación activa' });
       }
 
-      // Matar backend
-      sim.child.kill('SIGTERM');
-      setTimeout(() => sim.child.kill('SIGKILL'), 3000);
-
-      // Dropear BD clonada
-      await pool.query(`DROP DATABASE IF EXISTS ${SIM_DB}`);
-
-      delete simulations[req.user.client_id];
+      await cleanupSimulation(pool, simulations, req.user.client_id, 'manual-stop');
 
       res.json({ ok: true, message: 'Simulación finalizada. BD clonada eliminada.' });
     } catch (err) {
@@ -158,12 +159,36 @@ module.exports = function(app, pool, authenticate) {
       active: true,
       started_at: sim.started_at,
       pid: sim.child.pid,
-      backend_port: SIM_PORT
+      backend_port: SIM_PORT,
+      expires_at: sim.expires_at,
+      ttl_hours: 4
     });
   });
 };
 
 // ─── Helpers ──────────────────────────────────────────────
+
+async function cleanupSimulation(pool, simulations, clientId, reason) {
+  const sim = simulations[clientId];
+  if (!sim) return false;
+
+  if (sim.cleanup_timer) clearTimeout(sim.cleanup_timer);
+
+  if (sim.child && !sim.child.killed) {
+    sim.child.kill('SIGTERM');
+    setTimeout(() => {
+      try {
+        if (!sim.child.killed) sim.child.kill('SIGKILL');
+      } catch (_) {}
+    }, 3000);
+  }
+
+  await pool.query(`DROP DATABASE IF EXISTS ${SIM_DB}`);
+  delete simulations[clientId];
+  console.log(`[simulator] Cleanup completo (${reason}) para client ${clientId}`);
+  return true;
+}
+
 function waitForServer(port, timeoutMs) {
   return new Promise((resolve, reject) => {
     const start = Date.now();
