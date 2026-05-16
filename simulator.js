@@ -45,7 +45,7 @@ module.exports = function(app, pool, authenticate) {
       // Esperar a que el backend esté listo
       await waitForServer(SIM_PORT, 15000);
 
-      const sim = { child, client_id: req.user.client_id, started_at: new Date(), expires_at: new Date(Date.now() + SIM_TTL_MS), cleanup_timer: null };
+      const sim = { child, client_id: req.user.client_id, started_at: new Date(), expires_at: new Date(Date.now() + SIM_TTL_MS), session_key: `sim:${req.user.client_id}:${Date.now()}`, cleanup_timer: null };
       sim.cleanup_timer = setTimeout(() => {
         cleanupSimulation(pool, simulations, req.user.client_id, 'ttl-expired').catch(err => {
           console.error('[simulator] Error en cleanup TTL:', err);
@@ -60,7 +60,8 @@ module.exports = function(app, pool, authenticate) {
         model: GW_MODEL,
         gateway_port: GW_PORT,
         expires_at: sim.expires_at,
-        ttl_hours: 4
+        ttl_hours: 4,
+        session_key: sim.session_key
       });
     } catch (err) {
       console.error('[simulator] Error en start:', err);
@@ -83,7 +84,7 @@ module.exports = function(app, pool, authenticate) {
       const response = await callChatCompletions(GW_PORT, GW_TOKEN, GW_MODEL, [
         { role: 'system', content: 'Estás en MODO SIMULACIÓN. Usá http://localhost:4002 como base URL de la API. Contestá como lo harías normalmente, mostrando tu razonamiento si aplica.' },
         { role: 'user', content: message }
-      ]);
+      ], sim.session_key);
 
       res.json({
         ok: true,
@@ -223,7 +224,8 @@ module.exports = function(app, pool, authenticate) {
       pid: sim.child.pid,
       backend_port: SIM_PORT,
       expires_at: sim.expires_at,
-      ttl_hours: 4
+      ttl_hours: 4,
+      session_key: sim.session_key
     });
   });
 };
@@ -432,7 +434,7 @@ function waitForServer(port, timeoutMs) {
   });
 }
 
-function callChatCompletions(gwPort, gwToken, model, messages) {
+function callChatCompletions(gwPort, gwToken, model, messages, sessionKey = null) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ model, messages, max_tokens: 1000 });
     const req = http.request({
@@ -443,6 +445,7 @@ function callChatCompletions(gwPort, gwToken, model, messages) {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${gwToken}`,
+        ...(sessionKey ? { 'x-openclaw-session-key': sessionKey, 'x-openclaw-message-channel': 'simulator' } : {}),
         'Content-Length': Buffer.byteLength(body)
       }
     }, (res) => {
