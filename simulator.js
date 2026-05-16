@@ -445,7 +445,7 @@ function callChatCompletions(gwPort, gwToken, model, messages, sessionKey = null
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${gwToken}`,
-        ...(sessionKey ? { 'x-openclaw-session-key': sessionKey, 'x-openclaw-message-channel': 'simulator' } : {}),
+        ...(sessionKey ? { 'x-openclaw-session-key': sessionKey, 'x-openclaw-agent-id': 'demo-agent-sim', 'x-openclaw-message-channel': 'simulator' } : {}),
         'Content-Length': Buffer.byteLength(body)
       }
     }, (res) => {
