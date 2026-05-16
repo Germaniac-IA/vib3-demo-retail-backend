@@ -7421,6 +7421,12 @@ try {
 } catch (e) {
   if (e.code !== "MODULE_NOT_FOUND") console.error("Error cargando simulador:", e.message);
 }
+try {
+  require("./afip/afip")(app, pool, authenticate);
+  console.log("Modulo AFIP cargado");
+} catch (e) {
+  if (e.code !== "MODULE_NOT_FOUND") console.error("Error cargando AFIP:", e.message);
+}
 
 
 // Auto-expire budgets on startup and every hour
