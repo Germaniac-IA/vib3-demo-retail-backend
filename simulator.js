@@ -11,6 +11,17 @@ const GW_MODEL = 'openclaw/demo-agent-sim';
 const GW_REAL_MODEL = 'openclaw/demo-agent';
 const DB_URL = 'postgresql://demo_user:V1b3_D3m0_2026@localhost:5432';
 const SIM_TTL_MS = 4 * 60 * 60 * 1000; // 4 horas
+const SIM_SYSTEM_PROMPT = `Estás en MODO SIMULACIÓN. Usá http://localhost:4002 como base URL de la API.
+
+Objetivo del simulador: ayudar al usuario a evaluar procesos, no solo resultados.
+En cada respuesta explicá de forma clara y visible:
+1) qué entendiste del pedido,
+2) qué datos consultaste o vas a consultar,
+3) qué decisión tomaste y por qué,
+4) qué acción concreta hiciste o harías en el sistema.
+
+No reveles cadena interna de pensamiento ni razonamiento oculto; explicá el criterio operativo de manera resumida, auditable y útil para corregir procedimientos.
+Si una acción crea/modifica datos, aclaralo explícitamente y recordá que estás trabajando sobre una base clonada de simulación.`;
 
 module.exports = function(app, pool, authenticate) {
   const simulations = {};
@@ -53,6 +64,17 @@ module.exports = function(app, pool, authenticate) {
       }, SIM_TTL_MS);
       simulations[req.user.client_id] = sim;
 
+      let initialReply = null;
+      try {
+        const initResponse = await callChatCompletions(GW_PORT, GW_TOKEN, GW_MODEL, [
+          { role: 'system', content: SIM_SYSTEM_PROMPT },
+          { role: 'user', content: 'Inicializá esta simulación. Explicá brevemente cómo vas a trabajar: que vas a mostrar datos consultados, decisiones y acciones para que el usuario pueda corregir procesos.' }
+        ], sim.session_key);
+        initialReply = initResponse?.choices?.[0]?.message?.content || null;
+      } catch (initErr) {
+        console.error('[simulator] No se pudo inicializar sesión conversacional:', initErr.message || initErr);
+      }
+
       res.json({
         ok: true,
         session_id: req.user.client_id,
@@ -61,7 +83,8 @@ module.exports = function(app, pool, authenticate) {
         gateway_port: GW_PORT,
         expires_at: sim.expires_at,
         ttl_hours: 4,
-        session_key: sim.session_key
+        session_key: sim.session_key,
+        initial_reply: initialReply
       });
     } catch (err) {
       console.error('[simulator] Error en start:', err);
@@ -82,7 +105,7 @@ module.exports = function(app, pool, authenticate) {
 
       // Llamar al Chat Completions del gateway
       const response = await callChatCompletions(GW_PORT, GW_TOKEN, GW_MODEL, [
-        { role: 'system', content: 'Estás en MODO SIMULACIÓN. Usá http://localhost:4002 como base URL de la API. Contestá como lo harías normalmente, mostrando tu razonamiento si aplica.' },
+        { role: 'system', content: SIM_SYSTEM_PROMPT },
         { role: 'user', content: message }
       ], sim.session_key);
 
