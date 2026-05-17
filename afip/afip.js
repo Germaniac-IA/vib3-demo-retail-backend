@@ -29,6 +29,13 @@ function detectarTipoFactura(emisorCond, clienteCond) {
   return 6; // Default Factura B
 }
 
+const CREDIT_NOTE_TYPES = { 1: 3, 6: 8, 11: 13 }; // Factura A/B/C -> NC A/B/C
+const INVOICE_TYPES_BY_CREDIT_NOTE = { 3: 1, 8: 6, 13: 11 };
+
+function creditNoteTypeFor(invoiceType) {
+  return CREDIT_NOTE_TYPES[Number(invoiceType)] || null;
+}
+
 const CONSUMIDOR_FINAL_DOC_THRESHOLD = 10000000; // ARCA: identificación obligatoria CF >= $10.000.000
 
 function isConsumidorFinal(cond) {
@@ -60,6 +67,25 @@ function normalizeDocForAfip({ invoiceType, contactCuit, contactCondicionIva, to
 }
 
 module.exports = function (app, pool, authenticate) {
+
+  async function logAfipEvent({ req, invoiceId = null, orderId = null, batchId = null, eventType, status = 'info', message = null, requestPayload = null, responsePayload = null, errorPayload = null }) {
+    try {
+      await pool.query(`
+        INSERT INTO afip_emission_events
+          (client_id, invoice_id, order_id, emission_batch_id, event_type, event_status, message,
+           request_payload, response_payload, error_payload, created_by_user_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      `, [
+        req.user.client_id, invoiceId, orderId, batchId, eventType, status, message,
+        requestPayload ? JSON.stringify(requestPayload) : null,
+        responsePayload ? JSON.stringify(responsePayload) : null,
+        errorPayload ? JSON.stringify(errorPayload) : null,
+        req.user.id || null,
+      ]);
+    } catch (e) {
+      console.warn('[afip] No se pudo registrar evento:', e.message);
+    }
+  }
 
   // ─── Config AFIP desde fiscal_data ────────────────────────
 
@@ -355,11 +381,13 @@ module.exports = function (app, pool, authenticate) {
         result?.FeDetResp?.FECAEDetResponse?.[0] ||
         result?.FECAEDetResponse?.[0] || {};
 
-      await pool.query(`
+      const insertResult = await pool.query(`
         INSERT INTO afip_invoices
           (client_id, invoice_type, invoice_number, punto_venta, cae, cae_vencimiento,
-           result, obs, neto, iva, total, order_id, client_doc_type, client_doc_nro, client_name, raw_response)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+           result, obs, neto, iva, total, order_id, client_doc_type, client_doc_nro, client_name,
+           raw_response, voucher_kind, source, arca_request_payload, arca_response_payload, authorized_at, created_by_user_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'invoice','single',$17,$18,$19,$20)
+        RETURNING id
       `, [
         req.user.client_id, invType, nuevoNumero, ptoVta,
         fecaeResponse.CAE || null,
@@ -369,7 +397,22 @@ module.exports = function (app, pool, authenticate) {
         impNeto, impIva, impTotal, order_id || null,
         docTipo || null, docNro || null, clientName || null,
         JSON.stringify(result),
+        JSON.stringify(voucherData),
+        JSON.stringify(result),
+        fecaeResponse.Resultado === 'A' ? new Date() : null,
+        req.user.id || null,
       ]);
+
+      await logAfipEvent({
+        req,
+        invoiceId: insertResult.rows[0].id,
+        orderId: order_id || null,
+        eventType: fecaeResponse.Resultado === 'A' ? 'invoice_authorized' : 'invoice_rejected',
+        status: fecaeResponse.Resultado === 'A' ? 'success' : 'error',
+        message: fecaeResponse.Resultado === 'A' ? 'Factura autorizada por ARCA' : 'Factura rechazada por ARCA',
+        requestPayload: voucherData,
+        responsePayload: result,
+      });
 
       res.json({
         success: fecaeResponse.Resultado === 'A',
@@ -399,6 +442,130 @@ module.exports = function (app, pool, authenticate) {
       res.json({ success: true, comprobante: result });
     } catch (err) {
       res.status(500).json({ error: err.message });
+    }
+  });
+
+
+  // ─── Nota de Crédito: anulación total de factura ───────────
+
+  app.post('/api/afip/notas-credito', authenticate, requireAfip, async (req, res) => {
+    try {
+      const invoiceId = req.body.invoice_id;
+      const motivo = req.body.motivo || 'Anulación de comprobante';
+      if (!invoiceId) return res.status(400).json({ error: 'Debe enviar invoice_id' });
+
+      const invQ = await pool.query(`
+        SELECT ai.*
+        FROM afip_invoices ai
+        WHERE ai.id = $1 AND ai.client_id = $2 AND ai.voucher_kind = 'invoice' AND ai.result = 'A'
+      `, [invoiceId, req.user.client_id]);
+
+      if (invQ.rows.length === 0) {
+        return res.status(404).json({ error: 'Factura autorizada no encontrada' });
+      }
+      const inv = invQ.rows[0];
+
+      const existingNc = await pool.query(`
+        SELECT id, cae FROM afip_invoices
+        WHERE related_invoice_id = $1 AND voucher_kind = 'credit_note' AND result = 'A'
+        LIMIT 1
+      `, [invoiceId]);
+      if (existingNc.rows.length > 0) {
+        return res.status(409).json({ error: 'La factura ya tiene una Nota de Crédito autorizada', credit_note_id: existingNc.rows[0].id, cae: existingNc.rows[0].cae });
+      }
+
+      const ncType = creditNoteTypeFor(inv.invoice_type);
+      if (!ncType) return res.status(400).json({ error: `No hay tipo de NC configurado para comprobante ${inv.invoice_type}` });
+
+      const ptoVta = req.afipConfig.punto_venta || inv.punto_venta;
+      let ultimo;
+      try { ultimo = await afipService.getLastVoucher(req.afipConfig, ptoVta, ncType); }
+      catch (e) { ultimo = 0; }
+      const nuevoNumero = (ultimo || 0) + 1;
+      const today = new Date();
+      const invoiceDate = today.toISOString().slice(0, 10).replace(/-/g, '');
+
+      const impNeto = Math.abs(parseFloat(inv.neto || 0));
+      const impIva = Math.abs(parseFloat(inv.iva || 0));
+      const impTotal = Math.abs(parseFloat(inv.total || 0));
+      const ivaArray = impIva > 0 ? [{ Id: 5, BaseImp: impNeto, Importe: impIva }] : [];
+
+      const voucherData = {
+        punto_venta: ptoVta,
+        invoice_type: ncType,
+        concepto: 1,
+        doc_tipo: inv.client_doc_type || 99,
+        doc_nro: inv.client_doc_nro || 0,
+        numero_desde: nuevoNumero,
+        numero_hasta: nuevoNumero,
+        fecha: invoiceDate,
+        imp_neto: impNeto,
+        imp_iva: impIva,
+        imp_total: impTotal,
+        imp_trib: 0,
+        iva: ivaArray,
+        cbtes_asoc: [{
+          Tipo: inv.invoice_type,
+          PtoVta: inv.punto_venta,
+          Nro: inv.invoice_number,
+        }],
+      };
+
+      await logAfipEvent({ req, invoiceId, orderId: inv.order_id, eventType: 'credit_note_started', status: 'info', message: motivo, requestPayload: voucherData });
+
+      const result = await afipService.createVoucher(req.afipConfig, voucherData);
+      const fecaeResponse = result?.FeDetResp?.FECAEDetResponse?.[0] || result?.FECAEDetResponse?.[0] || {};
+
+      const insertResult = await pool.query(`
+        INSERT INTO afip_invoices
+          (client_id, invoice_type, invoice_number, punto_venta, cae, cae_vencimiento,
+           result, obs, neto, iva, total, order_id, client_doc_type, client_doc_nro, client_name,
+           raw_response, voucher_kind, related_invoice_id, source, arca_request_payload, arca_response_payload, authorized_at, created_by_user_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'credit_note',$17,'credit_note',$18,$19,$20,$21)
+        RETURNING id
+      `, [
+        req.user.client_id, ncType, nuevoNumero, ptoVta,
+        fecaeResponse.CAE || null,
+        fecaeResponse.CAEFchVto ? fecaeResponse.CAEFchVto.toString() : null,
+        fecaeResponse.Resultado || 'R',
+        fecaeResponse.Observaciones ? JSON.stringify(fecaeResponse.Observaciones) : motivo,
+        -impNeto, -impIva, -impTotal, inv.order_id || null,
+        inv.client_doc_type || null, inv.client_doc_nro || null, inv.client_name || null,
+        JSON.stringify(result),
+        invoiceId,
+        JSON.stringify(voucherData),
+        JSON.stringify(result),
+        fecaeResponse.Resultado === 'A' ? new Date() : null,
+        req.user.id || null,
+      ]);
+
+      await logAfipEvent({
+        req,
+        invoiceId: insertResult.rows[0].id,
+        orderId: inv.order_id || null,
+        eventType: fecaeResponse.Resultado === 'A' ? 'credit_note_authorized' : 'credit_note_rejected',
+        status: fecaeResponse.Resultado === 'A' ? 'success' : 'error',
+        message: motivo,
+        requestPayload: voucherData,
+        responsePayload: result,
+      });
+
+      res.json({
+        success: fecaeResponse.Resultado === 'A',
+        credit_note_id: insertResult.rows[0].id,
+        related_invoice_id: invoiceId,
+        cae: fecaeResponse.CAE,
+        cae_vencimiento: fecaeResponse.CAEFchVto,
+        resultado: fecaeResponse.Resultado,
+        numero: nuevoNumero,
+        punto_venta: ptoVta,
+        tipo: ncType,
+        observaciones: fecaeResponse.Observaciones || null,
+        raw: result,
+      });
+    } catch (err) {
+      console.error('[afip] Error emitiendo NC:', err.message);
+      res.status(500).json({ error: 'Error emitiendo Nota de Crédito: ' + err.message });
     }
   });
 
@@ -513,9 +680,12 @@ module.exports = function (app, pool, authenticate) {
       return res.status(400).json({ error: 'Debe enviar order_ids: []' });
     }
 
+    const batchId = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : require('crypto').randomUUID();
     const emitidas = [];
     const fallidas = [];
     const omitidas = [];
+
+    await logAfipEvent({ req, batchId, eventType: 'batch_started', status: 'info', message: `Inicio lote de ${orderIds.length} NVs`, requestPayload: { order_ids: orderIds, iva_pct: ivaPct } });
 
     for (const orderId of orderIds) {
       try {
@@ -595,11 +765,13 @@ module.exports = function (app, pool, authenticate) {
           result?.FeDetResp?.FECAEDetResponse?.[0] ||
           result?.FECAEDetResponse?.[0] || {};
 
-        await pool.query(`
+        const insertResult = await pool.query(`
           INSERT INTO afip_invoices
             (client_id, invoice_type, invoice_number, punto_venta, cae, cae_vencimiento,
-             result, obs, neto, iva, total, order_id, client_doc_type, client_doc_nro, client_name, raw_response)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+             result, obs, neto, iva, total, order_id, client_doc_type, client_doc_nro, client_name,
+             raw_response, voucher_kind, source, emission_batch_id, arca_request_payload, arca_response_payload, authorized_at, created_by_user_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'invoice','batch',$17,$18,$19,$20,$21)
+          RETURNING id
         `, [
           req.user.client_id, invType, nuevoNumero, ptoVta,
           fecaeResponse.CAE || null,
@@ -609,7 +781,24 @@ module.exports = function (app, pool, authenticate) {
           impNeto, impIva, impTotal, orderId,
           doc.doc_tipo || null, doc.doc_nro || null, ord.cname || null,
           JSON.stringify(result),
+          batchId,
+          JSON.stringify(voucherData),
+          JSON.stringify(result),
+          fecaeResponse.Resultado === 'A' ? new Date() : null,
+          req.user.id || null,
         ]);
+
+        await logAfipEvent({
+          req,
+          invoiceId: insertResult.rows[0].id,
+          orderId,
+          batchId,
+          eventType: fecaeResponse.Resultado === 'A' ? 'batch_invoice_authorized' : 'batch_invoice_rejected',
+          status: fecaeResponse.Resultado === 'A' ? 'success' : 'error',
+          message: fecaeResponse.Resultado === 'A' ? 'Factura de lote autorizada por ARCA' : 'Factura de lote rechazada por ARCA',
+          requestPayload: voucherData,
+          responsePayload: result,
+        });
 
         if (fecaeResponse.Resultado === 'A') {
           emitidas.push({
@@ -638,9 +827,12 @@ module.exports = function (app, pool, authenticate) {
       }
     }
 
+    await logAfipEvent({ req, batchId, eventType: 'batch_finished', status: fallidas.length ? 'warning' : 'success', message: `Lote finalizado: ${emitidas.length} emitidas, ${omitidas.length} omitidas, ${fallidas.length} fallidas`, responsePayload: { emitidas, omitidas, fallidas } });
+
     res.json({
       success: fallidas.length === 0,
       requested: orderIds.length,
+      emission_batch_id: batchId,
       emitidas,
       fallidas,
       omitidas,

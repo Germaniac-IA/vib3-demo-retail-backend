@@ -84,6 +84,11 @@ async function createVoucher(config, data) {
     Iva: data.iva || [],
     Tributos: data.tributos || [],
   };
+
+  if (data.cbtes_asoc && data.cbtes_asoc.length) {
+    voucherData.CbtesAsoc = data.cbtes_asoc;
+  }
+
   return await afip.ElectronicBilling.createVoucher(voucherData);
 }
 
