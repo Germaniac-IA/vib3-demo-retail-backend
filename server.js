@@ -29,6 +29,38 @@ const pool = new Pool({
 });
 
 
+
+async function getIvaAlicuotas(activeOnly = true) {
+  const where = activeOnly ? 'WHERE is_active = true' : '';
+  const { rows } = await pool.query(`SELECT codigo_afip, porcentaje, nombre, descripcion, is_active FROM iva_alicuotas ${where} ORDER BY sort_order, porcentaje`);
+  return rows;
+}
+
+function normalizeAlicuotaValue(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return NaN;
+  return Math.round(n * 100) / 100;
+}
+
+async function validateIvaAlicuota(value, { allowNull = false } = {}) {
+  const normalized = normalizeAlicuotaValue(value);
+  if (normalized === null && allowNull) return null;
+  if (normalized === null) return 21;
+  if (Number.isNaN(normalized)) {
+    const err = new Error('Alícuota IVA inválida');
+    err.statusCode = 400;
+    throw err;
+  }
+  const result = await pool.query('SELECT porcentaje FROM iva_alicuotas WHERE is_active = true AND porcentaje = $1', [normalized]);
+  if (result.rows.length === 0) {
+    const err = new Error('Alícuota IVA no permitida. Usá una alícuota parametrizada.');
+    err.statusCode = 400;
+    throw err;
+  }
+  return normalized;
+}
+
 async function getNextOrderNumber(db, clientId) {
   const { rows } = await db.query(
     `SELECT COALESCE(MAX(CAST(SUBSTRING(order_number FROM 4) AS INTEGER)), 0) + 1 AS next_num
@@ -315,6 +347,15 @@ app.put('/api/clients/:id', authenticate, async (req, res) => {
 });
 
 // ─── LEADS STATS ─────────────────────────────────────────────
+
+app.get('/api/iva-alicuotas', authenticate, async (req, res) => {
+  try {
+    res.json(await getIvaAlicuotas(true));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/fiscal-data/:clientId', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM fiscal_data WHERE deleted_at IS NULL AND client_id = $1', [req.params.clientId]);
@@ -326,22 +367,24 @@ app.get('/api/fiscal-data/:clientId', authenticate, async (req, res) => {
 
 app.put('/api/fiscal-data/:clientId', authenticate, async (req, res) => {
   try {
-    const { razon_social, cuit, condicion_iva, situacion_iibb, numero_iibb } = req.body;
+    const { razon_social, cuit, condicion_iva, situacion_iibb, numero_iibb, alicuota_default } = req.body;
+    const alicuotaDefault = await validateIvaAlicuota(alicuota_default || 21);
     const result = await pool.query(
-      `INSERT INTO fiscal_data (client_id, razon_social, cuit, condicion_iva, situacion_iibb, numero_iibb)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO fiscal_data (client_id, razon_social, cuit, condicion_iva, situacion_iibb, numero_iibb, alicuota_default)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (client_id) DO UPDATE SET
          razon_social=EXCLUDED.razon_social,
          cuit=EXCLUDED.cuit,
          condicion_iva=EXCLUDED.condicion_iva,
          situacion_iibb=EXCLUDED.situacion_iibb,
-         numero_iibb=EXCLUDED.numero_iibb
+         numero_iibb=EXCLUDED.numero_iibb,
+         alicuota_default=EXCLUDED.alicuota_default
        RETURNING *`,
-      [req.params.clientId, razon_social, cuit, condicion_iva, situacion_iibb, numero_iibb]
+      [req.params.clientId, razon_social, cuit, condicion_iva, situacion_iibb, numero_iibb, alicuotaDefault]
     );
     res.json(result.rows[0]);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -812,7 +855,8 @@ app.get('/api/products', authenticate, async (req, res) => {
 
 app.post('/api/products', authenticate, async (req, res) => {
   try {
-    const { sku, sku_externo, name, description, commercial_description, category_id, brand_id, price, unit, stock_quantity, min_stock, requires_stock, is_premium, premium_level, cost_price, image_url, genera_diseno, diseno_template_url } = req.body;
+    const { sku, sku_externo, name, description, commercial_description, category_id, brand_id, price, unit, stock_quantity, min_stock, requires_stock, is_premium, premium_level, cost_price, image_url, genera_diseno, diseno_template_url, has_attributes, alicuota } = req.body;
+    const alicuotaProducto = await validateIvaAlicuota(alicuota, { allowNull: true });
     
     let finalSku = sku || null;
     // Auto-generate SKU if category has auto_generate_sku and no SKU provided
@@ -827,8 +871,8 @@ app.post('/api/products', authenticate, async (req, res) => {
     }
 
     const result = await pool.query(
-      `INSERT INTO products (client_id, sku, sku_externo, name, description, commercial_description, category_id, brand_id, price, unit, stock_quantity, min_stock, requires_stock, is_premium, premium_level, cost_price, image_url, genera_diseno, diseno_template_url, has_attributes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) RETURNING *`,
+      `INSERT INTO products (client_id, sku, sku_externo, name, description, commercial_description, category_id, brand_id, price, unit, stock_quantity, min_stock, requires_stock, is_premium, premium_level, cost_price, image_url, genera_diseno, diseno_template_url, has_attributes, alicuota)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) RETURNING *`,
       [req.user.client_id, finalSku, sku_externo || null, name, description || null,
        commercial_description || null, category_id || null, brand_id || null,
        price || 0, unit || 'unidad',
@@ -837,20 +881,18 @@ app.post('/api/products', authenticate, async (req, res) => {
        requires_stock || false,
        is_premium || false,
        is_premium ? (premium_level || 5) : null,
-       cost_price || 0,
-       image_url || null,
-       genera_diseno || false,
-       diseno_template_url || null, has_attributes || false]
+       cost_price || 0, image_url || null, genera_diseno || false, diseno_template_url || null, has_attributes || false, alicuotaProducto]
     );
     res.status(201).json(result.rows[0]);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
 app.put('/api/products/:id', authenticate, async (req, res) => {
   try {
-    const { sku, sku_externo, name, description, commercial_description, category_id, brand_id, price, unit, stock_quantity, min_stock, requires_stock, is_premium, premium_level, cost_price, is_active, image_url, genera_diseno, diseno_template_url, has_attributes } = req.body;
+    const { sku, sku_externo, name, description, commercial_description, category_id, brand_id, price, unit, stock_quantity, min_stock, requires_stock, is_premium, premium_level, cost_price, is_active, image_url, genera_diseno, diseno_template_url, has_attributes, alicuota } = req.body;
+    const alicuotaProducto = await validateIvaAlicuota(alicuota, { allowNull: true });
 
     let finalSku = (sku && String(sku).trim()) ? String(sku).trim() : null;
     // Auto-generate SKU on edit too, if category has auto_generate_sku and SKU was left empty
@@ -872,10 +914,12 @@ app.put('/api/products/:id', authenticate, async (req, res) => {
         unit=COALESCE($9,unit), stock_quantity=COALESCE($10,stock_quantity), min_stock=COALESCE($11,min_stock),
         requires_stock=COALESCE($12,requires_stock), is_premium=COALESCE($13,is_premium), premium_level=COALESCE($14,premium_level),
         cost_price=COALESCE($15,cost_price), is_active=COALESCE($16,is_active), image_url=NULLIF($17,''),
-        genera_diseno=COALESCE($18,genera_diseno), diseno_template_url=COALESCE($19,diseno_template_url), has_attributes=COALESCE($20,has_attributes), updated_at=NOW()
-       WHERE id=$21 AND client_id=$22 RETURNING *`,
+        genera_diseno=COALESCE($18,genera_diseno), diseno_template_url=COALESCE($19,diseno_template_url), has_attributes=COALESCE($20,has_attributes),
+        alicuota=$21, updated_at=NOW()
+       WHERE id=$22 AND client_id=$23 RETURNING *`,
       [finalSku, sku_externo, name, description, commercial_description, category_id, brand_id, price, unit, stock_quantity, min_stock,
-       requires_stock, is_premium, premium_level, cost_price, is_active, image_url, genera_diseno, diseno_template_url, has_attributes, req.params.id, req.user.client_id]
+       requires_stock, is_premium, premium_level, cost_price, is_active, image_url, genera_diseno, diseno_template_url, has_attributes,
+       alicuotaProducto, req.params.id, req.user.client_id]
     );
     if (result.rows[0]) {
       if (requires_stock === false) {
@@ -887,7 +931,7 @@ app.put('/api/products/:id', authenticate, async (req, res) => {
     }
     res.json(result.rows[0] || null);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -1449,7 +1493,7 @@ app.delete('/api/contacts/:contactId/notes/:noteId', authenticate, async (req, r
 app.get('/api/sale-channels', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, name, is_active, sort_order, COALESCE(has_delivery, false) as has_delivery, COALESCE(immediate_delivery, false) as immediate_delivery FROM sale_channels WHERE deleted_at IS NULL AND client_id = $1 AND is_active = true ORDER BY sort_order, name',
+      `SELECT id, name, is_active, sort_order, COALESCE(has_delivery, false) as has_delivery, COALESCE(immediate_delivery, false) as immediate_delivery, COALESCE(auto_invoice, false) as auto_invoice, afip_pos_id, (SELECT ap.name || ' · PV ' || ap.punto_venta FROM afip_points_of_sale ap WHERE ap.id = sale_channels.afip_pos_id) as afip_pos_name FROM sale_channels WHERE deleted_at IS NULL AND client_id = $1 AND is_active = true ORDER BY sort_order, name`,
       [req.user.client_id]
     );
     res.json(result.rows);
@@ -1458,10 +1502,10 @@ app.get('/api/sale-channels', authenticate, async (req, res) => {
 
 app.post('/api/sale-channels', authenticate, async (req, res) => {
   try {
-    const { name, is_active, sort_order, has_delivery, immediate_delivery } = req.body;
+    const { name, is_active, sort_order, has_delivery, immediate_delivery, auto_invoice, afip_pos_id } = req.body;
     const result = await pool.query(
-      'INSERT INTO sale_channels (client_id, name, is_active, sort_order, has_delivery, immediate_delivery) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-      [req.user.client_id, name, is_active !== false, sort_order || 0, has_delivery === true, immediate_delivery === true]
+      'INSERT INTO sale_channels (client_id, name, is_active, sort_order, has_delivery, immediate_delivery, auto_invoice, afip_pos_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
+      [req.user.client_id, name, is_active !== false, sort_order || 0, has_delivery === true, immediate_delivery === true, auto_invoice === true, afip_pos_id || null]
     );
     res.status(201).json(result.rows[0]);
   } catch (error) { res.status(500).json({ error: error.message }); }
@@ -1469,10 +1513,10 @@ app.post('/api/sale-channels', authenticate, async (req, res) => {
 
 app.put('/api/sale-channels/:id', authenticate, async (req, res) => {
   try {
-    const { name, is_active, sort_order, has_delivery, immediate_delivery } = req.body;
+    const { name, is_active, sort_order, has_delivery, immediate_delivery, auto_invoice, afip_pos_id } = req.body;
     const result = await pool.query(
-      'UPDATE sale_channels SET name=COALESCE($1,name), is_active=COALESCE($2,is_active), sort_order=COALESCE($3,sort_order), has_delivery=COALESCE($4,has_delivery), immediate_delivery=COALESCE($5,immediate_delivery) WHERE id=$6 AND client_id=$7 RETURNING *',
-      [name, is_active, sort_order, has_delivery, immediate_delivery, req.params.id, req.user.client_id]
+      'UPDATE sale_channels SET name=COALESCE($1,name), is_active=COALESCE($2,is_active), sort_order=COALESCE($3,sort_order), has_delivery=COALESCE($4,has_delivery), immediate_delivery=COALESCE($5,immediate_delivery), auto_invoice=COALESCE($6,auto_invoice), afip_pos_id=$7 WHERE id=$8 AND client_id=$9 RETURNING *',
+      [name, is_active, sort_order, has_delivery, immediate_delivery, auto_invoice, afip_pos_id || null, req.params.id, req.user.client_id]
     );
     res.json(result.rows[0] || null);
   } catch (error) { res.status(500).json({ error: error.message }); }
@@ -1838,6 +1882,14 @@ app.get('/api/orders', authenticate, async (req, res) => {
         sc.name as sale_channel_name, sc.has_delivery as sale_channel_has_delivery,
         os.name as order_status_name, os.color as order_status_color,
         pst.name as payment_status_name, pst.color as payment_status_color,
+        (SELECT ai.id FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_id,
+        (SELECT ai.cae FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_cae,
+        (SELECT ai.result FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_resultado,
+        (SELECT ai.invoice_type FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_tipo,
+        (SELECT ai.invoice_number FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_numero,
+        (SELECT nc.id FROM afip_invoices nc JOIN afip_invoices fi ON fi.id = nc.related_invoice_id WHERE fi.order_id = o.id AND fi.client_id = o.client_id AND nc.voucher_kind = 'credit_note' AND nc.result = 'A' ORDER BY nc.id DESC LIMIT 1) as nc_id,
+        (SELECT nc.cae FROM afip_invoices nc JOIN afip_invoices fi ON fi.id = nc.related_invoice_id WHERE fi.order_id = o.id AND fi.client_id = o.client_id AND nc.voucher_kind = 'credit_note' AND nc.result = 'A' ORDER BY nc.id DESC LIMIT 1) as nc_cae,
+        (SELECT nc.invoice_number FROM afip_invoices nc JOIN afip_invoices fi ON fi.id = nc.related_invoice_id WHERE fi.order_id = o.id AND fi.client_id = o.client_id AND nc.voucher_kind = 'credit_note' AND nc.result = 'A' ORDER BY nc.id DESC LIMIT 1) as nc_numero,
         GREATEST(COALESCE(op.paid_sum, 0), COALESCE(cm.paid_sum, 0)) as payment_paid,
         COALESCE(o.total, 0) - GREATEST(COALESCE(op.paid_sum, 0), COALESCE(cm.paid_sum, 0)) as payment_pending
       FROM orders o
@@ -1935,6 +1987,14 @@ app.get('/api/orders/:id', authenticate, async (req, res) => {
         sc.name as sale_channel_name, sc.has_delivery as sale_channel_has_delivery,
         os.name as order_status_name, os.color as order_status_color,
         pst.name as payment_status_name, pst.color as payment_status_color,
+        (SELECT ai.id FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_id,
+        (SELECT ai.cae FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_cae,
+        (SELECT ai.result FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_resultado,
+        (SELECT ai.invoice_type FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_tipo,
+        (SELECT ai.invoice_number FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_numero,
+        (SELECT nc.id FROM afip_invoices nc JOIN afip_invoices fi ON fi.id = nc.related_invoice_id WHERE fi.order_id = o.id AND fi.client_id = o.client_id AND nc.voucher_kind = 'credit_note' AND nc.result = 'A' ORDER BY nc.id DESC LIMIT 1) as nc_id,
+        (SELECT nc.cae FROM afip_invoices nc JOIN afip_invoices fi ON fi.id = nc.related_invoice_id WHERE fi.order_id = o.id AND fi.client_id = o.client_id AND nc.voucher_kind = 'credit_note' AND nc.result = 'A' ORDER BY nc.id DESC LIMIT 1) as nc_cae,
+        (SELECT nc.invoice_number FROM afip_invoices nc JOIN afip_invoices fi ON fi.id = nc.related_invoice_id WHERE fi.order_id = o.id AND fi.client_id = o.client_id AND nc.voucher_kind = 'credit_note' AND nc.result = 'A' ORDER BY nc.id DESC LIMIT 1) as nc_numero,
         GREATEST(COALESCE(op.paid_sum, 0), COALESCE(cm.paid_sum, 0)) as payment_paid,
         COALESCE(o.total, 0) - GREATEST(COALESCE(op.paid_sum, 0), COALESCE(cm.paid_sum, 0)) as payment_pending
       FROM orders o
@@ -2149,6 +2209,14 @@ app.post('/api/orders', authenticate, async (req, res) => {
     ]);
 
     const orderId = orderResult.rows[0].id;
+    let shouldAutoInvoice = false;
+    if (sale_channel_id) {
+      const autoInvoiceRow = await client.query(
+        'SELECT COALESCE(auto_invoice, false) as auto_invoice, afip_pos_id FROM sale_channels WHERE id = $1 AND client_id = $2 AND deleted_at IS NULL',
+        [sale_channel_id, req.user.client_id]
+      );
+      shouldAutoInvoice = Boolean(autoInvoiceRow.rows[0]?.auto_invoice);
+    }
 
     for (const item of (items || [])) {
       const fulfillmentStatus = item.is_service
@@ -2281,7 +2349,26 @@ app.post('/api/orders', authenticate, async (req, res) => {
       console.error('Error auto-creating design requests:', designErr.message);
     }
 
-    res.status(201).json({ id: orderId, order_number: orderNum, message: 'Venta creada' });
+    let autoInvoiceResult = null;
+    if (shouldAutoInvoice) {
+      try {
+        const authHeader = req.headers.authorization || '';
+        const autoRes = await fetch(`http://127.0.0.1:${PORT}/api/afip/facturar`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader },
+          body: JSON.stringify({ order_id: orderId })
+        });
+        autoInvoiceResult = await autoRes.json().catch(() => ({ error: 'Respuesta inválida de facturación' }));
+        if (!autoRes.ok || autoInvoiceResult?.success === false) {
+          console.error('Auto-facturación falló para NV', orderId, autoInvoiceResult?.error || autoInvoiceResult?.resultado || autoRes.status);
+        }
+      } catch (autoErr) {
+        autoInvoiceResult = { success: false, error: autoErr.message };
+        console.error('Auto-facturación falló para NV', orderId, autoErr.message);
+      }
+    }
+
+    res.status(201).json({ id: orderId, order_number: orderNum, message: 'Venta creada', auto_invoice: shouldAutoInvoice, auto_invoice_result: autoInvoiceResult });
   } catch (error) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: error.message });
@@ -3252,6 +3339,25 @@ app.post('/api/leads/:id/resolve', authenticate, async (req, res) => {
 app.delete('/api/orders/:id', authenticate, async (req, res) => {
   const client = await pool.connect();
   try {
+    // No permitir eliminar ventas facturadas sin Nota de Crédito autorizada
+    const { rows: fiscalRows } = await client.query(`
+      SELECT fi.id as factura_id, fi.cae as factura_cae, nc.id as nc_id
+      FROM afip_invoices fi
+      LEFT JOIN afip_invoices nc ON nc.related_invoice_id = fi.id AND nc.voucher_kind = 'credit_note' AND nc.result = 'A'
+      WHERE fi.order_id = $1 AND fi.client_id = $2 AND fi.voucher_kind = 'invoice' AND fi.result = 'A'
+      ORDER BY fi.id DESC
+      LIMIT 1
+    `, [req.params.id, req.user.client_id]);
+    if (fiscalRows.length > 0 && !fiscalRows[0].nc_id) {
+      return res.status(400).json({
+        error: 'No se puede eliminar una venta facturada sin emitir antes Nota de Crédito',
+        details: 'Emití la NC de la factura y luego eliminá la venta si corresponde.',
+        factura_id: fiscalRows[0].factura_id,
+        factura_cae: fiscalRows[0].factura_cae,
+        requires_credit_note: true,
+      });
+    }
+
     // Verificar si la orden tiene pagos asociados
     const { rows: payments } = await client.query(
       'SELECT op.id, op.amount, pm.name AS method, op.paid_at FROM order_payments op LEFT JOIN payment_methods pm ON pm.id = op.payment_method_id WHERE op.order_id = $1 AND op.deleted_at IS NULL ORDER BY op.paid_at',
@@ -7420,6 +7526,12 @@ try {
   console.log("Modulo simulador cargado");
 } catch (e) {
   if (e.code !== "MODULE_NOT_FOUND") console.error("Error cargando simulador:", e.message);
+}
+try {
+  require("./afip/afip")(app, pool, authenticate);
+  console.log("Modulo AFIP cargado");
+} catch (e) {
+  if (e.code !== "MODULE_NOT_FOUND") console.error("Error cargando AFIP:", e.message);
 }
 
 
