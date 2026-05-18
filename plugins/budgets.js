@@ -1,5 +1,6 @@
 // Plugin: Presupuestos (Budgets)
 const PDFDocument = require('pdfkit');
+const { renderHtmlToPdf, buildBudgetItems } = require('../html2pdf');
 
 module.exports = function(app, pool, authenticate) {
 
@@ -283,6 +284,36 @@ module.exports = function(app, pool, authenticate) {
       const money = (n) => '$' + Number(n || 0).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
       const date = (v) => v ? new Date(v).toLocaleDateString('es-AR') : '—';
       const safe = (v) => (v === null || v === undefined || v === '') ? '—' : String(v);
+
+      // ── Try HTML template (puppeteer) first ──
+      if (design.template_html && design.template_html.trim()) {
+        try {
+          const itemsHtml = buildBudgetItems(items || [], money, showPrices);
+          const notaHtml = budget.notes ? '<div class="notes"><strong>Notas:</strong><br>' + String(budget.notes) + '</div>' : '';
+          const vars = {
+            COLOR: color,
+            LOGO: '',
+            NUMERO: safe(budget.number),
+            CONTACT: safe(budget.client_name),
+            FECHA: date(budget.created_at),
+            VENCE: budget.valid_until ? date(budget.valid_until) : 'Sin vencimiento',
+            ESTADO: String(budget.status || 'pendiente').toUpperCase(),
+            ITEMS: itemsHtml,
+            SUBTOTAL: money(budget.subtotal),
+            DESCUENTO: money(budget.discount || 0),
+            TOTAL: money(budget.total),
+            NOTAS: notaHtml,
+            FOOTER: safe(design.footer_text || 'Presupuesto sujeto a disponibilidad y confirmación.'),
+          };
+          const pdf = await renderHtmlToPdf(design.template_html, vars);
+          res.setHeader('Content-Type', 'application/pdf');
+          res.setHeader('Content-Disposition', 'attachment; filename="Presupuesto-' + budget.number + '.pdf"');
+          res.setHeader('Content-Length', pdf.length);
+          return res.send(pdf);
+        } catch (e) {
+          console.error('HTML template PDF failed, falling back to PDFKit:', e.message);
+        }
+      }
 
       const doc = new PDFDocument({ size: 'A4', margin: 42, bufferPages: true });
       const chunks = [];

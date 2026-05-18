@@ -7534,6 +7534,12 @@ try {
   if (e.code !== "MODULE_NOT_FOUND") console.error("Error cargando AFIP:", e.message);
 }
 
+try {
+  require('./plugins/facturacion')(app, pool, authenticate);
+  console.log('Plugin facturacion cargado');
+} catch (e) {
+  if (e.code !== 'MODULE_NOT_FOUND') console.error('Error cargando facturacion:', e.message);
+}
 
 // Auto-expire budgets on startup and every hour
 setTimeout(async () => {
